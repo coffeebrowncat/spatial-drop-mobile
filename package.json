@@ -1,0 +1,24 @@
+{
+  "name": "spatial-drop-mobile",
+  "version": "1.0.0",
+  "main": "node_modules/expo/AppEntry.js",
+  "scripts": {
+    "start": "expo start"
+  },
+  "keywords": [],
+  "type": "commonjs",
+  "dependencies": {
+    "expo": "^54.0.2",
+    "expo-document-picker": "~14.0.8",
+    "expo-file-system": "~19.0.23",
+    "expo-haptics": "~15.0.8",
+    "expo-image-picker": "~17.0.11",
+    "expo-sharing": "~14.0.8",
+    "react": "19.1.0",
+    "react-dom": "19.1.0",
+    "react-native": "0.81.5",
+    "react-native-gesture-handler": "~2.28.0",
+    "react-native-svg": "15.12.1",
+    "react-native-web": "~0.21.0"
+  }
+}
