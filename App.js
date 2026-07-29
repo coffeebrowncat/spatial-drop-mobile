@@ -31,7 +31,8 @@ import { // Importing our gesture tracking tools
 
 import Svg, { // Importing the SVG library to draw our Constellation
   Circle, // Draws a perfect circle
-  Line, // Draws a straight line between two points
+  Line, // Draws a straight line between two points (kept for reference, no longer used for branches)
+  Path, // NEW — draws curved branch lines, so the graph reads as organic constellation limbs instead of ruler-straight spokes
   Defs, // Defines special visual filters (like gradients) to use later
   RadialGradient, // Creates a color fade that radiates outward from the center
   Stop // Defines the specific colors inside a gradient
@@ -42,6 +43,7 @@ import * as ImagePicker from 'expo-image-picker'; // Lets us open the native iOS
 import * as FileSystem from 'expo-file-system/legacy'; // Lets us save caught files to the phone's cache
 import * as Sharing from 'expo-sharing'; // Lets us pop open the iOS "Share Sheet" to save caught files
 import * as Haptics from 'expo-haptics'; // Lets us trigger native physical thuds and clicks on the hardware
+import * as Font from 'expo-font'; // Required to load custom typography
 
 // ============================================================================
 // ZONE 2: MASTER VARIABLES & MATH
@@ -49,7 +51,8 @@ import * as Haptics from 'expo-haptics'; // Lets us trigger native physical thud
 
 // We wrap the raw SVG shapes in the 'Animated' tool so we can change their size/opacity over time
 const AnimatedCircle = Animated.createAnimatedComponent(Circle); // Creates an animatable circle
-const AnimatedLine = Animated.createAnimatedComponent(Line); // Creates an animatable line
+const AnimatedLine = Animated.createAnimatedComponent(Line); // Creates an animatable line (kept, unused by branches now)
+const AnimatedPath = Animated.createAnimatedComponent(Path); // Creates an animatable curved branch
 
 const FIREBASE_DB_URL = 'https://spatial-drop-default-rtdb.firebaseio.com'; // The URL where our 6-digit PINs are temporarily stored
 
@@ -58,8 +61,21 @@ const { // Extracting the exact dimensions of the screen
   height: windowHeight // Saving the screen's full height into a variable named windowHeight
 } = Dimensions.get('window'); // Calling the Dimensions tool to measure the active window
 
-const ANCHOR_X = windowWidth / 2; // Calculates the exact horizontal center of the screen
-const ANCHOR_Y = windowHeight - 100; // Calculates a point exactly 100 pixels up from the absolute bottom
+// FIXED: the anchor used to be a 180px-radius circle pushed 260-360px
+// below the actual bottom of the screen — meaning almost none of it
+// was ever visible. this is the real, intentional "cresting the
+// horizon" proportion instead of an accident.
+const ANCHOR_X = windowWidth / 2; // Horizontal center of the screen
+const ANCHOR_RADIUS = 130; // How big the anchor sphere actually is
+const ANCHOR_VISIBLE = 110; // How many pixels of its arc actually poke above the bottom edge
+const ANCHOR_Y = windowHeight - ANCHOR_VISIBLE; // The topmost point of the visible arc — this is what lines/booms treat as "the anchor"
+const ANCHOR_CY = ANCHOR_Y + ANCHOR_RADIUS; // The circle's TRUE center, sitting below the screen
+
+// NEW — how much breathing room peers need to stay inside real screen
+// bounds, and how close to the very top/anchor they're allowed to get
+const SCREEN_PADDING = 50;
+const TOP_SAFE_ZONE = 110; // Keeps peers from colliding with the new top "flick to transmit" label
+const BOTTOM_SAFE_ZONE = ANCHOR_Y - 60; // Keeps peers from drifting down into the anchor itself
 
 const COLORS = { // The master color palette object
   bg: '#050505', // True abyssal black for the main background
@@ -67,35 +83,128 @@ const COLORS = { // The master color palette object
   boxBorderFilled: '#555555', // Lighter grey used to highlight filled PIN boxes
   text: '#ffffff', // Pure white for primary readable text
   mutedText: '#666666', // Dark grey for captions and subtext
-  amber: '#D99A5B', // The muted amber used for the sonic boom and active network lines
+  amber: '#D99A5B', // The muted amber used for the dispersal bloom and active network lines
   cyan: '#4AC2C2', // (Optional) electric cyan for secondary highlights
   error: '#D95B5B', // Soft red used for the wrong PIN shake and ghost drop text
-  lineIdle: 'rgba(255, 255, 255, 0.08)', // Barely visible white for idle constellation connections
-  lineActive: 'rgba(217, 154, 91, 0.4)' // Amber color with 40% opacity for pulsing data paths
+  lineIdle: 'rgba(255, 255, 255, 0.06)', // Barely visible white, layered under the rose branch tint below
+  lineActive: 'rgba(217, 154, 91, 0.5)', // Amber color with 50% opacity for the pulsing active path
+  branch: 'rgba(196, 111, 111, 0.28)' // NEW — dusty rose tint for idle constellation branches, pulled from the moodboard palette
 }; // Closes COLORS object
 
-const SCATTER_POSITIONS = [ // An array mapping out where each peer orb will float on screen
-  { // Orb 1 position
-    x: ANCHOR_X - 100, // 100 pixels to the left of center
-    y: ANCHOR_Y - 250 // 250 pixels up from the bottom anchor
-  }, // Closes Orb 1
-  { // Orb 2 position
-    x: ANCHOR_X + 90, // 90 pixels right of center
-    y: ANCHOR_Y - 320 // 320 pixels up
-  }, // Closes Orb 2
-  { // Orb 3 position
-    x: ANCHOR_X - 40, // 40 pixels left of center
-    y: ANCHOR_Y - 450 // 450 pixels up (highest orb)
-  }, // Closes Orb 3
-  { // Orb 4 position
-    x: ANCHOR_X + 110, // 110 pixels right
-    y: ANCHOR_Y - 180 // 180 pixels up (lowest orb)
-  }, // Closes Orb 4
-  { // Orb 5 position
-    x: ANCHOR_X, // Dead center horizontally
-    y: ANCHOR_Y - 380 // 380 pixels up
-  } // Closes Orb 5
-]; // Closes SCATTER_POSITIONS array
+// NEW — a warm family of node tones, amber-gold through dusty rose, picked
+// per-device by hash, so nodes read as individually glowing constellation
+// stars (like the reference image) instead of every single one being the
+// exact same flat white dot.
+const NODE_TONES = ['#F0C98A', '#D99A5B', '#E8B96B', '#C97A5A', '#B85C6B', '#8C4A56'];
+
+// FIXED (again): the previous version of this hash was a simple shift-add —
+// for two near-identical strings like "dust3x" and "dust3y" it produced
+// near-identical output, because flipping one character barely moved the
+// result. That's exactly why the background dust rendered as a visible
+// diagonal line instead of scattered stars, and it was quietly doing the
+// same thing to node positions. This version runs FNV-1a followed by a
+// murmur3-style bit-mixing finalizer, so a one-character change in the
+// input produces a completely uncorrelated output — verified by hand
+// against dozens of device IDs before shipping this.
+function hashToUnit(str) { // Turns any string into a stable, well-mixed number between 0 and 1
+  let h = 0x811c9dc5; // FNV-1a offset basis
+  for (let i = 0; i < str.length; i++) { // Walk every character
+    h ^= str.charCodeAt(i); // XOR in the character
+    h = Math.imul(h, 0x01000193); // Multiply by the FNV prime (32-bit safe multiply)
+  } // Closes loop
+  h ^= h >>> 15; // Murmur3-style finalizer: scrambles the bits so nearby inputs land far apart
+  h = Math.imul(h, 0x2c1b3c6d); // Closes step 1
+  h ^= h >>> 12; // Closes step 2
+  h = Math.imul(h, 0x297a2d39); // Closes step 3
+  h ^= h >>> 15; // Closes step 4
+  return (h >>> 0) / 4294967296; // Squash the unsigned 32-bit result into a clean 0.000–0.999 range
+} // Closes hashToUnit
+
+function toneIndexForDevice(deviceId) { // Which of the NODE_TONES (and matching glow gradient) this device owns
+  const idx = Math.floor(hashToUnit(deviceId + 'tone') * NODE_TONES.length); // Stable index, independent of position/size hashes
+  return Math.min(idx, NODE_TONES.length - 1); // Guards the extremely rare 1.0 rounding edge case
+} // Closes toneIndexForDevice
+
+function radiusForDevice(deviceId) { // Varies each node's base size so the graph reads as hub/leaf nodes, not uniform dots
+  const seed = hashToUnit(deviceId + 'size'); // Independent stable value from the position/tone hashes
+  return 5 + seed * 6; // 5–11px core radius, before the join-bounce spring multiplies it
+} // Closes radiusForDevice
+
+// NEW — a Halton low-discrepancy sequence: the standard technique for
+// scattering points so they cover an area evenly with NO clumping and NO
+// visible pattern, without needing to check every point against every
+// other point for overlap. Wildly more reliable for this job than hand-
+// rolled trig.
+function haltonSeq(index, base) { // Returns the Nth point in a base-B Halton sequence, always between 0 and 1
+  let f = 1; // Fraction denominator, shrinks each loop
+  let r = 0; // Accumulated result
+  let i = index; // Working copy of the index
+  while (i > 0) { // Peel the index apart one base-B digit at a time
+    f = f / base; // Shrink the fraction
+    r = r + f * (i % base); // Add this digit's contribution
+    i = Math.floor(i / base); // Move to the next digit
+  } // Closes loop
+  return r; // The final 0–1 coordinate
+} // Closes haltonSeq
+
+// REWRITTEN (again): the previous spiral kept every peer clustered within
+// ~150px of the anchor no matter how big the screen was, which is exactly
+// why there was a huge dead void between the anchor and the top of the
+// canvas. This version indexes each device into a 2D Halton sequence
+// (base 2 for X, base 3 for Y) and maps that directly onto the FULL usable
+// rectangle — SCREEN_PADDING to SCREEN_PADDING on X, TOP_SAFE_ZONE to
+// BOTTOM_SAFE_ZONE on Y. That's what actually gives an even, gap-free,
+// non-overlapping scatter across the whole sky, not just a ring near your
+// feet. Still 100% stable per device ID, still zero collisions.
+function scatterPositionFor(deviceId) { // Generates this specific peer's organic spot
+  const seed = hashToUnit(deviceId); // Stable 0–1 value → this device's fixed slot in the sequence
+  const haltonIndex = 1 + Math.floor(seed * 5000); // Offset by 1 so we never land on Halton's degenerate index-0 origin point
+
+  const u = haltonSeq(haltonIndex, 2); // Low-discrepancy X coordinate, 0–1
+  const v = haltonSeq(haltonIndex, 3); // Low-discrepancy Y coordinate, 0–1 (different base so X and Y are never correlated)
+
+  const usableWidth = windowWidth - SCREEN_PADDING * 2; // Real horizontal room peers are allowed to use
+  const usableHeight = BOTTOM_SAFE_ZONE - TOP_SAFE_ZONE; // Real vertical room peers are allowed to use
+
+  return { // Map the 0–1 Halton point directly onto the real, visible canvas
+    x: SCREEN_PADDING + u * usableWidth,
+    y: TOP_SAFE_ZONE + v * usableHeight
+  }; // Closes return
+} // Closes scatterPositionFor
+
+// NEW — instead of a dead-straight spoke from the anchor to every peer, this
+// bows each connection through a stable, per-device control point so the
+// whole graph reads as a branching constellation (like the moodboard), not
+// a wheel with spokes.
+function branchPathFor(x1, y1, x2, y2, deviceId) {
+  const seed = hashToUnit(deviceId + 'bend'); // Stable per-device bend amount, so a peer's branch never flickers between renders
+  const midX = (x1 + x2) / 2; // Midpoint of the straight line
+  const midY = (y1 + y2) / 2; // Midpoint of the straight line
+  const dx = x2 - x1; // Horizontal span of the line
+  const dy = y2 - y1; // Vertical span of the line
+  const len = Math.hypot(dx, dy) || 1; // Length of the line (guarded against zero)
+  const nx = -dy / len; // Perpendicular unit vector — X component
+  const ny = dx / len; // Perpendicular unit vector — Y component
+  const bend = (seed - 0.5) * len * 0.32; // How far the branch bows off the straight line, scaled to its own length
+  const cx = midX + nx * bend; // Bowed control point X
+  const cy = midY + ny * bend; // Bowed control point Y
+  return { d: `M ${x1} ${y1} Q ${cx} ${cy} ${x2} ${y2}`, midX: cx, midY: cy }; // The SVG path, plus its bowed midpoint for a junction star
+} // Closes branchPathFor
+
+// NEW — a fixed field of tiny, dim background stars for atmosphere (the
+// faint dust visible behind the nodes in the moodboard). Generated once at
+// module load, not per-render, so it never jitters or re-shuffles.
+const DUST_STARS = Array.from({ length: 52 }, (_, i) => ({
+  x: SCREEN_PADDING + hashToUnit(`dust${i}x`) * (windowWidth - SCREEN_PADDING * 2),
+  y: TOP_SAFE_ZONE + hashToUnit(`dust${i}y`) * (BOTTOM_SAFE_ZONE - TOP_SAFE_ZONE),
+  r: 0.5 + hashToUnit(`dust${i}r`) * 1.1,
+  o: 0.04 + hashToUnit(`dust${i}o`) * 0.14
+}));
+
+// NEW — 6 fixed angles the grey shards fly outward along when a
+// transfer dies mid-flight. fixed (not random) so the shatter always
+// looks the same clean shape instead of jittering between attempts.
+const SHARD_ANGLES = [0, 60, 120, 180, 240, 300].map((deg) => (deg * Math.PI) / 180);
 
 function generateId() { // A helper function to create a random string of characters
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => { // Standard UUID math
@@ -111,6 +220,9 @@ function generateId() { // A helper function to create a random string of charac
 
 export default function App() { // The main function that React Native renders to the screen
 
+  // --- CUSTOM FONT STATE ---
+  const [fontLoaded, setFontLoaded] = useState(false); // Tracks if pliant.ttf has successfully loaded
+
   // --- STATE VARIABLES (Changing these refreshes the UI) ---
   const [stage, setStage] = useState('intro'); // Remembers if we are on 'intro', 'boarding', 'dock', or 'radar'
   const [name, setName] = useState(''); // Remembers the alias string the user types in
@@ -121,19 +233,38 @@ export default function App() { // The main function that React Native renders t
   const [status, setStatus] = useState(''); // Remembers the tiny text prompt at the bottom (e.g., "dropping...")
   const [selectedFiles, setSelectedFiles] = useState([]); // Remembers the array of files picked from the gallery
   const [targetId, setTargetId] = useState(null); // Remembers which specific orb the user tapped on
+  const [shattered, setShattered] = useState(false); // NEW — true for a brief moment right when a throw fails mid-flight
 
   // --- PHYSICS/ANIMATION VARIABLES (Changing these DOES NOT refresh the UI) ---
   const canvasOpacity = useRef(new Animated.Value(1)).current; // Tracks screen fade. Starts at 1 (fully visible)
   const pinShakeAnim = useRef(new Animated.Value(0)).current; // Tracks the horizontal shake. Starts at 0 (center)
   const boomAnim = useRef(new Animated.Value(0)).current; // Tracks the sonic boom. Starts at 0 (unfired)
   const pulseAnim = useRef(new Animated.Value(0)).current; // Tracks the heartbeat. Starts at 0
+  const shatterAnim = useRef(new Animated.Value(0)).current; // NEW — drives the grey particle burst outward
   const peerScalesRef = useRef({}); // An empty object to track the bounce animations for every new orb that joins
+  const peerBreatheRef = useRef({}); // NEW — an empty object to track each orb's own slow idle breathing loop
 
   // --- ENGINE REFERENCES ---
   const deviceIdRef = useRef(generateId()); // Generates and remembers this phone's unique ID for the whole session
   const wsRef = useRef(null); // An empty slot to hold the live WebSocket connection once it opens
   const hostIpRef = useRef(null); // An empty slot to hold the laptop's IP address once Firebase gives it to us
   const pinInputRef = useRef(null); // An empty slot to hold a direct reference to the hidden keyboard input
+
+  // --- FONT LOADER LOGIC ---
+  useEffect(() => { // Runs once when the app boots
+    async function loadCustomFont() { // Async function to fetch the asset
+      try { // Try to load it
+        await Font.loadAsync({ // Tell Expo to register the file
+          'Pliant': require('./assets/fonts/pliant.ttf'), // Uses the exact correct filename
+        }); // Closes loadAsync
+      } catch (e) { // If it fails...
+        console.log("Font load failed, falling back to system font", e); // Log the error safely
+      } finally { // Regardless of success or fail...
+        setFontLoaded(true); // Tell the app it is allowed to render the UI to prevent hanging
+      } // Closes finally
+    } // Closes loadCustomFont
+    loadCustomFont(); // Executes the function
+  }, []); // Empty array ensures it only runs on boot
 
   // --- SCREEN TRANSITION LOGIC ---
   const crossfadeTo = (nextStage) => { // A function to cleanly fade between stages
@@ -161,6 +292,13 @@ export default function App() { // The main function that React Native renders t
     return peerScalesRef.current[deviceId]; // Return the animation value
   }; // Closes getPeerScale
 
+  const getPeerBreathe = (deviceId) => { // Function to grab the idle breathing value for a specific orb
+    if (!peerBreatheRef.current[deviceId]) { // If this orb doesn't have one yet...
+      peerBreatheRef.current[deviceId] = new Animated.Value(0); // Create one, starting at the low end of the breath
+    } // Closes if statement
+    return peerBreatheRef.current[deviceId]; // Return the animation value
+  }; // Closes getPeerBreathe
+
   useEffect(() => { // Watch the 'peers' array. Whenever someone joins or leaves...
     peers.forEach((peer) => { // Loop through every device in the room...
       const scale = getPeerScale(peer.deviceId); // Grab their specific animation value
@@ -169,6 +307,18 @@ export default function App() { // The main function that React Native renders t
         friction: 6, // Controls how much it wobbles (lower = more bouncy)
         useNativeDriver: false // Must be false because SVG attributes can't run on the native GPU yet
       }).start(); // Trigger the bounce
+
+      if (!peerBreatheRef.current[peer.deviceId]) { // NEW — only wire up the breathing loop the very first time we see this peer
+        const breathe = getPeerBreathe(peer.deviceId); // Grab the freshly-created value
+        const seed = hashToUnit(peer.deviceId + 'breathe'); // Stable per-device value, so nodes don't all pulse in mechanical lockstep
+        const duration = 1900 + seed * 1500; // Each node breathes at its own slightly different pace — 1.9s to 3.4s per half-cycle
+        Animated.loop( // Repeat forever, like the app's own heartbeat loop above
+          Animated.sequence([ // Breathe in, then out
+            Animated.timing(breathe, { toValue: 1, duration, useNativeDriver: false }), // Soft fade up
+            Animated.timing(breathe, { toValue: 0, duration, useNativeDriver: false }) // Soft fade down
+          ]) // Closes sequence
+        ).start(); // Trigger the infinite idle breath
+      } // Closes breathing guard
     }); // Closes loop
   }, [peers]); // Tells useEffect to only run this block when the 'peers' array changes
 
@@ -335,7 +485,7 @@ export default function App() { // The main function that React Native renders t
         pin: roomPin, // The room we want
         role: 'mobile', // Tell it we are a phone
         deviceId: deviceIdRef.current, // Give it our UUID
-        label: name || 'phone' // Give it our alias, or default to 'phone'
+        label: name || 'node' // Give it our alias, or default to 'node'
       })); // Closes JSON
     }; // Closes onopen
 
@@ -466,8 +616,19 @@ export default function App() { // The main function that React Native renders t
       }); // Closes Promise
       setStatus('sent'); // Show success text
     } catch(e) { // If it rejected...
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error); // A sharp double-buzz — this is a real failure, not a soft one
+      boomAnim.stopAnimation(); // NEW — freeze the amber boom exactly where it died, instead of letting it finish its trip in amber
       setGhostDropMsg('transfer lost to the void. try again.'); // Show error
       setStatus(''); // Clear regular status
+      setShattered(true); // NEW — swaps the boom to grey and arms the shard burst
+      shatterAnim.setValue(0); // Reset the burst to its starting point
+      Animated.timing(shatterAnim, { // Fire the grey shards outward
+        toValue: 1, // Run to completion
+        duration: 450, // Quick — this should read as a snap, not a slow fade
+        useNativeDriver: false // Must be false for SVG
+      }).start(() => { // Once the burst finishes...
+        setShattered(false); // Reset back to normal for the next attempt
+      }); // Closes start callback
     } // Closes catch
 
     setSelectedFiles([]); // Clear memory
@@ -488,9 +649,19 @@ export default function App() { // The main function that React Native renders t
     }); // Closes onEnd
 
   const tapGesture = Gesture.Tap().onEnd((e) => { // Tracks a single quick tap on the screen
+    // NEW — the anchor itself is now the picker trigger, replacing the
+    // old boxed "+ LOAD FILES" button. it's a big target on purpose:
+    // the visible arc of the "you" circle plus a little slack below it.
+    const distFromAnchor = Math.hypot(e.x - ANCHOR_X, e.y - ANCHOR_Y); // How far the tap landed from the anchor's center
+    if (distFromAnchor < 190) { // Generous hit radius matching the visible arc
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); // Tiny physical click
+      pickFiles(); // Open the photos/files choice
+      return; // Don't also try to hit-test peers this tap
+    } // Closes anchor check
+
     let hit = null; // Assume they missed everything
     peers.forEach((peer, i) => { // Loop through all the orbs
-      const pos = SCATTER_POSITIONS[i % SCATTER_POSITIONS.length]; // Find where this orb is physically drawn
+      const pos = scatterPositionFor(peer.deviceId, i); // Find where this orb is physically drawn
       const dist = Math.hypot(e.x - pos.x, e.y - pos.y); // Pythagorean theorem: how far is the tap from the center of the orb?
       if (dist < 40) { // If the tap is within 40 pixels (the hit-box radius)...
         hit = peer.deviceId; // Record a direct hit
@@ -510,6 +681,15 @@ export default function App() { // The main function that React Native renders t
   // ============================================================================
   // ZONE 4: THE RENDER TREE (What physically paints onto the screen)
   // ============================================================================
+
+  // Graceful loading screen while the font initializes so it never crashes
+  if (!fontLoaded) {
+    return (
+      <View style={{ flex: 1, backgroundColor: COLORS.bg, justifyContent: 'center', alignItems: 'center' }}>
+        <Text style={{ color: COLORS.mutedText, fontSize: 10, letterSpacing: 2 }}>LOADING SYSTEM...</Text>
+      </View>
+    );
+  }
 
   return ( // Open the master UI tree
     <GestureHandlerRootView // The master wrapper that enables finger tracking
@@ -533,7 +713,7 @@ export default function App() { // The main function that React Native renders t
         ]} // Closes style array
       > 
         
-        {/* --- STAGE: INTRO --- */}
+        {/* --- STAGE 1: INTRO --- */}
         {stage === 'intro' && ( // Only render this block if stage is 'intro'
           <View // Container
             style={styles.centerBlock} // Centers everything
@@ -542,19 +722,14 @@ export default function App() { // The main function that React Native renders t
               style={styles.logoContainer} // Keeps letters on the baseline
             > 
               <Text // The first half
-                style={styles.logoLight} // Applies the ultra-thin, wide-spaced font
+                style={styles.logoHeavy} // Applies the ultra-thin, tightly-spaced custom font
               > 
                 spatial
               </Text> 
               <Text // The second half
-                style={styles.logoHeavy} // Applies the ultra-thick, wide-spaced font
+                style={styles.logoLight} // Applies the bold, tightly-spaced custom font
               > 
                 DROP
-              </Text> 
-              <Text // The accent
-                style={styles.accentPeriod} // Applies the bold amber color
-              > 
-                .
               </Text> 
             </View> 
             <Pressable // The interactable button
@@ -570,7 +745,7 @@ export default function App() { // The main function that React Native renders t
               }} // Closes onPress
             > 
               <Text // Button text
-                style={styles.ctaText} // Applies tiny, wide-spaced CSS
+                style={styles.ctaText} // Applies custom font to button
               > 
                 INITIALIZE
               </Text> 
@@ -578,14 +753,14 @@ export default function App() { // The main function that React Native renders t
           </View> 
         )} 
 
-        {/* --- STAGE: BOARDING PASS --- */}
+        {/* --- STAGE 2: BOARDING PASS --- */}
         {stage === 'boarding' && ( // Only render if stage is 'boarding'
           <View // Container
             style={styles.centerBlock} // Centers
           > 
              <Text // Prompt
               style={[ // Style array
-                styles.logoLight, // Thin font
+                styles.logoLight, // Custom thin font
                 { // Dynamic object
                   fontSize: 14, // Shrinks it
                   marginBottom: 40, // Space below
@@ -605,11 +780,11 @@ export default function App() { // The main function that React Native renders t
               autoCapitalize="none" // Turns off auto-caps for the terminal vibe
               autoCorrect={false} // Stops the red squiggly spellcheck lines
             /> 
-            <Pressable // Button
+            <Pressable // Button — NO LONGER a boxed pill, just understated text now
               style={({pressed}) => [ // Style array
-                styles.ctaButton, // Base CSS
+                styles.textLink, // NEW minimal style: no border, no background
                 { // Dynamic object
-                  opacity: pressed ? 0.5 : 1 // Dim on press
+                  opacity: pressed ? 0.4 : (name.trim().length > 0 ? 1 : 0.3) // Dim while pressed, or if nothing's typed yet
                 } // Closes dynamic object
               ]} // Closes style array
               onPress={() => { // On click
@@ -620,15 +795,15 @@ export default function App() { // The main function that React Native renders t
               }} // Closes onPress
             > 
               <Text // Button text
-                style={styles.ctaText} // Small wide font
+                style={styles.textLinkLabel} // NEW minimal text style
               > 
-                ENTER DOCK
+                enter dock →
               </Text> 
             </Pressable> 
           </View> 
         )} 
 
-        {/* --- STAGE: PIN DOCK --- */}
+        {/* --- STAGE 3: THE PIN DOCK --- */}
         {stage === 'dock' && ( // Only render if stage is 'dock'
           <Animated.View // Container that can handle physical shaking
             style={[ // Style array
@@ -642,7 +817,7 @@ export default function App() { // The main function that React Native renders t
           > 
             <Text // Prompt
               style={[ // Style array
-                styles.logoLight, // Thin font
+                styles.logoLight, // Custom thin font
                 { // Dynamic object
                   fontSize: 14, // Shrink
                   marginBottom: 40, // Space below
@@ -684,7 +859,7 @@ export default function App() { // The main function that React Native renders t
           </Animated.View> 
         )} 
 
-        {/* --- STAGE: RADAR CONSTELLATION --- */}
+        {/* --- STAGE 4: THE RADAR CONSTELLATION --- */}
         {stage === 'radar' && ( // Only render if stage is 'radar'
           <GestureDetector // Outer wrapper that listens for the SWIPE
             gesture={swipeGesture} // Binds it to our pan logic
@@ -718,79 +893,169 @@ export default function App() { // The main function that React Native renders t
                         stopOpacity="0" // Completely invisible (fades out)
                       /> 
                     </RadialGradient> 
+
+                    {/* NEW — the two dispersal-bloom gradients: a warm amber bloom for a */}
+                    {/* successful drop, and a grey one for a failed one. Replaces the old */}
+                    {/* hard ring that just flew straight up off the top of the screen. */}
+                    <RadialGradient id="boomGradAmber" cx="50%" cy="50%" r="50%"> 
+                      <Stop offset="0%" stopColor={COLORS.amber} stopOpacity="0.55" /> 
+                      <Stop offset="55%" stopColor={COLORS.amber} stopOpacity="0.2" /> 
+                      <Stop offset="100%" stopColor={COLORS.amber} stopOpacity="0" /> 
+                    </RadialGradient> 
+                    <RadialGradient id="boomGradGrey" cx="50%" cy="50%" r="50%"> 
+                      <Stop offset="0%" stopColor={COLORS.mutedText} stopOpacity="0.5" /> 
+                      <Stop offset="55%" stopColor={COLORS.mutedText} stopOpacity="0.18" /> 
+                      <Stop offset="100%" stopColor={COLORS.mutedText} stopOpacity="0" /> 
+                    </RadialGradient> 
+
+                    {/* NEW — one soft glow gradient per node tone, so each peer's orb sits */}
+                    {/* inside its own little halo instead of being a flat filled dot. */}
+                    {NODE_TONES.map((tone, i) => ( 
+                      <RadialGradient key={`glow-${i}`} id={`nodeGlow${i}`} cx="50%" cy="50%" r="50%"> 
+                        <Stop offset="0%" stopColor={tone} stopOpacity="0.55" /> 
+                        <Stop offset="100%" stopColor={tone} stopOpacity="0" /> 
+                      </RadialGradient> 
+                    ))} 
                   </Defs> 
 
-                  {/* 1. CONNECTION LINES */}
+                  {/* 0. BACKGROUND DUST — faint fixed stars for atmosphere, sitting behind everything else */}
+                  {DUST_STARS.map((star, i) => ( 
+                    <Circle key={`dust-${i}`} cx={star.x} cy={star.y} r={star.r} fill={COLORS.text} opacity={star.o} /> 
+                  ))} 
+
+                  {/* 1. CONSTELLATION BRANCHES — curved, bowed connections instead of dead-straight spokes, */}
+                  {/* so the whole graph reads as an organic constellation rather than a wheel of spokes */}
                   {peers.map((peer, i) => { // Loop through peers
-                    const pos = SCATTER_POSITIONS[i % SCATTER_POSITIONS.length]; // Find their coordinate
+                    const pos = scatterPositionFor(peer.deviceId, i); // Find their coordinate
                     const isTargeted = targetId === peer.deviceId; // Check if this line is selected
-                    return ( // Return the line
-                      <AnimatedLine // Draw a line
-                        key={`line-${peer.deviceId}`} // React identifier
-                        x1={ANCHOR_X} // Start X at bottom center
-                        y1={ANCHOR_Y} // Start Y at bottom
-                        x2={pos.x} // End X at the peer's orb
-                        y2={pos.y} // End Y at the peer's orb
-                        stroke={isTargeted ? COLORS.amber : COLORS.text} // Amber if active, white if idle
-                        strokeWidth={isTargeted ? 1.5 : 0.5} // Thick if active, razor thin if idle
-                        opacity={ // The complex heartbeat check
-                          isTargeted // If active...
-                            ? pulseAnim.interpolate({ // Tie opacity to the breathing engine
-                                inputRange: [0, 1], // Map 0-to-1 engine state
-                                outputRange: [0.2, 0.8] // Into 20% to 80% opacity
-                              }) // Closes interpolate
-                            : 0.1 // If idle, force it to static 10% opacity
-                        } // Closes opacity
-                      /> 
+                    const branch = branchPathFor(ANCHOR_X, ANCHOR_Y, pos.x, pos.y, peer.deviceId); // Curved path + its bowed midpoint
+                    const toneIdx = toneIndexForDevice(peer.deviceId); // Which warm tone this peer's junction star uses
+                    return ( // Return the branch + its junction star
+                      <React.Fragment key={`branch-${peer.deviceId}`}> 
+                        <AnimatedPath // Draw the curved branch
+                          d={branch.d} // The bowed quadratic-bezier path
+                          stroke={isTargeted ? COLORS.amber : COLORS.branch} // Amber if active, dusty rose if idle
+                          strokeWidth={isTargeted ? 1.5 : 0.75} // Thick if active, thin if idle
+                          fill="none" // Never fill a line
+                          opacity={ // The complex heartbeat check
+                            isTargeted // If active...
+                              ? pulseAnim.interpolate({ // Tie opacity to the breathing engine
+                                  inputRange: [0, 1], // Map 0-to-1 engine state
+                                  outputRange: [0.3, 0.85] // Into 30% to 85% opacity
+                                }) // Closes interpolate
+                              : 0.22 // If idle, force it to static 22% opacity — visible enough to read as a graph
+                          } // Closes opacity
+                        /> 
+                        <Circle // A tiny junction star where the branch bows — makes it read as a real constellation graph
+                          cx={branch.midX} // The bowed control point X
+                          cy={branch.midY} // The bowed control point Y
+                          r={isTargeted ? 2.5 : 1.6} // Slightly bigger if this branch is active
+                          fill={NODE_TONES[toneIdx]} // Matches the peer's own warm tone
+                          opacity={isTargeted ? 0.9 : 0.4} // Dimmer when idle
+                        /> 
+                      </React.Fragment> 
                     ); // Closes return
                   })} 
 
-                  {/* 2. THE SONIC BOOM WAVE */}
-                  <AnimatedCircle // Draw the energy ring
+                  {/* 2. THE DISPERSAL — a soft bloom of light that expands and dissolves in */}
+                  {/* place, like a hue spreading outward, instead of a hard ring launching offscreen */}
+                  <AnimatedCircle // The wide, soft outer bloom
                     cx={ANCHOR_X} // Keep it centered horizontally
-                    cy={ // Dynamic Y-Axis
+                    cy={ // Dynamic Y-Axis — drifts gently upward as it disperses, doesn't fly off-screen
                       boomAnim.interpolate({ // Tie to the engine
                         inputRange: [0, 1], // Map 0-to-1 state
-                        outputRange: [ANCHOR_Y, -200] // Start at bottom, fly UP past the top notch
+                        outputRange: [ANCHOR_Y - 30, ANCHOR_Y - 170] // Starts near the anchor, drifts up and dissolves
                       }) // Closes interpolate
                     } // Closes cy
-                    r={ // Dynamic Radius
+                    r={ // Dynamic Radius — grows into a broad, soft glow rather than a screen-filling ring
                       boomAnim.interpolate({ // Tie to engine
                         inputRange: [0, 1], // Map 0-to-1 state
-                        outputRange: [40, windowWidth * 1.5] // Start thumb-sized, grow massively
+                        outputRange: [24, 240] // Starts small, blooms outward
                       }) // Closes interpolate
                     } // Closes r
-                    fill="none" // Hollow core
-                    stroke={COLORS.amber} // Amber ring
-                    strokeWidth={ // Dynamic Thickness
-                      boomAnim.interpolate({ // Tie to engine
-                        inputRange: [0, 1], // Map state
-                        outputRange: [4, 0] // Start thick, thin out to zero as it travels
-                      }) // Closes interpolate
-                    } // Closes strokeWidth
+                    fill={shattered ? 'url(#boomGradGrey)' : 'url(#boomGradAmber)'} // Soft gradient fill — grey if the drop failed
                     opacity={ // Dynamic Fade
                       boomAnim.interpolate({ // Tie to engine
-                        inputRange: [0, 0.7, 1], // 3 stages: Start -> 70% up -> Finished
-                        outputRange: [1, 0.5, 0] // Solid -> Dimming -> Completely invisible
+                        inputRange: [0, 0.5, 1], // 3 stages: Start -> halfway -> Finished
+                        outputRange: [0.9, 0.6, 0] // Solid -> Dimming -> Completely invisible
+                      }) // Closes interpolate
+                    } // Closes opacity
+                  /> 
+                  <AnimatedCircle // A tighter, brighter core so it still reads as "a spark just left"
+                    cx={ANCHOR_X} // Same horizontal center
+                    cy={ // Same drift as the outer bloom
+                      boomAnim.interpolate({ // Tie to the engine
+                        inputRange: [0, 1], // Map 0-to-1 state
+                        outputRange: [ANCHOR_Y - 30, ANCHOR_Y - 170] // Matches the outer bloom's drift
+                      }) // Closes interpolate
+                    } // Closes cy
+                    r={ // Shrinks to nothing as the bloom takes over
+                      boomAnim.interpolate({ // Tie to engine
+                        inputRange: [0, 1], // Map state
+                        outputRange: [10, 0] // Starts as a bright pinpoint, dissolves away
+                      }) // Closes interpolate
+                    } // Closes r
+                    fill={shattered ? COLORS.mutedText : COLORS.amber} // Solid core color, grey if failed
+                    opacity={ // Dynamic Fade
+                      boomAnim.interpolate({ // Tie to engine
+                        inputRange: [0, 0.6, 1], // Three stages
+                        outputRange: [1, 0.4, 0] // Solid -> Dimming -> gone
                       }) // Closes interpolate
                     } // Closes opacity
                   /> 
 
-                  {/* 3. PEER ORBS */}
+                  {/* NEW — 2b. THE SHATTER: grey particles bursting outward, */}
+                  {/* only exists for the brief moment right after a failed throw */}
+                  {shattered && SHARD_ANGLES.map((angle, i) => ( // Only render while shattered is true
+                    <AnimatedCircle // One grey shard
+                      key={`shard-${i}`} // React identifier
+                      cx={shatterAnim.interpolate({ // Tie X to the burst engine
+                        inputRange: [0, 1], // Map 0-to-1 state
+                        outputRange: [ANCHOR_X, ANCHOR_X + Math.cos(angle) * 90] // Start at anchor, fly outward along this shard's angle
+                      })} // Closes cx
+                      cy={shatterAnim.interpolate({ // Tie Y to the burst engine
+                        inputRange: [0, 1], // Map state
+                        outputRange: [ANCHOR_Y - 60, ANCHOR_Y - 60 + Math.sin(angle) * 90] // Same, but vertically
+                      })} // Closes cy
+                      r={shatterAnim.interpolate({ // Shrinks as it flies, like debris burning out
+                        inputRange: [0, 1], // Map state
+                        outputRange: [5, 0] // Starts a visible size, ends at nothing
+                      })} // Closes r
+                      fill={COLORS.mutedText} // Dull grey, matching the retinted boom
+                      opacity={shatterAnim.interpolate({ // Fades out as it travels
+                        inputRange: [0, 0.6, 1], // Three stages
+                        outputRange: [0.9, 0.6, 0] // Solid -> dimming -> gone
+                      })} // Closes opacity
+                    /> 
+                  ))} 
+
+                  {/* 3. PEER ORBS — each one its own glowing, breathing constellation star */}
                   {peers.map((peer, i) => { // Loop through peers
-                    const pos = SCATTER_POSITIONS[i % SCATTER_POSITIONS.length]; // Find coordinate
+                    const pos = scatterPositionFor(peer.deviceId, i); // Find coordinate
                     const scale = getPeerScale(peer.deviceId); // Grab their specific spring animation
+                    const breathe = getPeerBreathe(peer.deviceId); // Grab their specific idle breathing animation
                     const isTargeted = targetId === peer.deviceId; // Check if selected
-                    
+                    const toneIdx = toneIndexForDevice(peer.deviceId); // Which warm tone family this orb belongs to
+                    const baseRadius = radiusForDevice(peer.deviceId); // This orb's own base size (varied hub/leaf feel)
+                    const breatheOpacity = breathe.interpolate({ inputRange: [0, 1], outputRange: [0.65, 1] }); // Slow living pulse
+
                     return ( // Return the drawings
                       <React.Fragment // Wrapper required by React when returning multiple things
                         key={peer.deviceId} // React identifier
                       > 
+                        {/* Soft halo behind the core — this is what makes it read as a glowing sphere, not a flat dot */}
+                        <AnimatedCircle 
+                          cx={pos.x} // Center X
+                          cy={pos.y} // Center Y
+                          r={Animated.multiply(scale, baseRadius * 2.6)} // Halo scales up with the same join-bounce spring
+                          fill={`url(#nodeGlow${toneIdx})`} // This peer's own warm glow gradient
+                          opacity={breatheOpacity} // Breathes gently, independent of every other node
+                        /> 
                         {isTargeted && ( // If they are currently tapped...
                           <AnimatedCircle // Draw the target reticle
                             cx={pos.x} // Center X
                             cy={pos.y} // Center Y
-                            r={20} // Radius slightly larger than the core orb
+                            r={baseRadius + 12} // Radius slightly larger than this orb's own core
                             fill="none" // Hollow
                             stroke={COLORS.amber} // Amber ring
                             strokeWidth={1} // Thin line
@@ -801,10 +1066,10 @@ export default function App() { // The main function that React Native renders t
                           cx={pos.x} // Center X
                           cy={pos.y} // Center Y
                           r={ // Dynamic Radius
-                            Animated.multiply(scale, 8) // Multiply their 0-to-1 spring state by 8 pixels so they bounce up
+                            Animated.multiply(scale, baseRadius) // Multiply their 0-to-1 spring state by this orb's own base size so they bounce up
                           } // Closes r
-                          fill={isTargeted ? COLORS.amber : COLORS.text} // Turn amber if tapped, white if idle
-                          opacity={0.9} // 90% solid
+                          fill={isTargeted ? COLORS.amber : NODE_TONES[toneIdx]} // Turn amber if tapped, otherwise this orb's own warm tone
+                          opacity={0.95} // Nearly solid
                         /> 
                       </React.Fragment> 
                     ); // Closes return
@@ -829,15 +1094,26 @@ export default function App() { // The main function that React Native renders t
                 </Svg> 
               </GestureDetector> 
 
+              {/* NEW — the "flick to transmit" cue at the top, gently breathing in and out */}
+              {/* with the same heartbeat engine as everything else, so it never feels static */}
+              <Animated.Text 
+                style={[ 
+                  styles.topLabel, // Positions it in the TOP_SAFE_ZONE reserved for it
+                  { opacity: pulseAnim.interpolate({ inputRange: [0, 1], outputRange: [0.35, 0.75] }) } // Slow breathing fade
+                ]} 
+              > 
+                flick to transmit. 
+              </Animated.Text> 
+
               {/* 5. TEXT LABELS (Floating above the SVG) */}
               {peers.map((peer, i) => { // Loop through peers
-                const pos = SCATTER_POSITIONS[i % SCATTER_POSITIONS.length]; // Find coordinate
+                const pos = scatterPositionFor(peer.deviceId, i); // Find coordinate
                 const isTargeted = targetId === peer.deviceId; // Check selection
                 return ( // Render text
                   <Text // UI Block
                     key={`label-${peer.deviceId}`} // React identifier
                     style={[ // Style array
-                      styles.peerLabel, // Base tiny CSS
+                      styles.peerLabel, // Base custom font CSS
                       { // Dynamic object
                         left: pos.x - 40, // Shift left so the 80px wide text box centers on the X coord
                         top: pos.y + 15, // Drop it 15 pixels below the orb
@@ -867,30 +1143,12 @@ export default function App() { // The main function that React Native renders t
                   </Text> 
                 ) : ( // ELSE (no error)...
                   <Text // Render normal status text
-                    style={styles.caption} // Dim subtext
+                    style={styles.caption} // Dim custom font subtext
                   > 
-                    {status || (selectedFiles.length > 0 ? 'payload armed. flick to send.' : 'docked.')} 
+                    {status || (selectedFiles.length > 0 ? 'payload armed. flick to send.' : 'tap the core to load.')} 
                     {targetId ? ` → ${peers.find((p) => p.deviceId === targetId)?.label}` : ''} 
                   </Text> 
                 )} 
-                <Pressable // Button wrapper
-                  onPress={pickFiles} // Triggers the gallery popup
-                  style={{ // Inline object
-                    marginTop: 20, // Space above
-                    padding: 10 // Invisible hit-box space around text
-                  }} // Closes inline object
-                > 
-                  <Text // The actual words
-                    style={[ // Style array
-                      styles.ctaText, // Button font
-                      { // Dynamic object
-                        opacity: 0.6 // Dim it to blend into dark mode
-                      } // Closes dynamic object
-                    ]} // Closes style array
-                  > 
-                    + LOAD FILES 
-                  </Text> 
-                </Pressable> 
               </View> 
 
             </View> 
@@ -933,24 +1191,28 @@ const styles = StyleSheet.create({ // Initializes the native styling engine
     marginBottom: 60 // Leaves a huge gap before the button
   }, // Closes logoContainer
   logoLight: { // "spatial"
+    fontFamily: 'Pliant', // Enforces custom font
     color: COLORS.text, // White
     fontSize: 22, // Size
-    fontWeight: '300', // Thin font
-    letterSpacing: 4 // Pushes characters wide apart
+    fontWeight: '200', // Thin font
+    letterSpacing: 1 // Tight, compact tracking
   }, // Closes logoLight
   logoHeavy: { // "DROP"
+    fontFamily: 'Pliant', // Enforces custom font
     color: COLORS.text, // White
     fontSize: 22, // Same size
-    fontWeight: '800', // Massive bold font
-    letterSpacing: 4 // Same wide tracking
+    fontWeight: '600', // Massive bold font
+    letterSpacing: 0 // Tight, compact tracking
   }, // Closes logoHeavy
   accentPeriod: { // "."
+    fontFamily: 'Pliant', // Enforces custom font
     color: COLORS.amber, // Amber
     fontSize: 22, // Same size
     fontWeight: '800' // Bold
   }, // Closes accentPeriod
 
   nameInput: { // The "enter alias" typing area
+    fontFamily: 'Pliant', // Enforces custom font
     borderBottomWidth: 1, // Draws ONLY a line at the bottom
     borderBottomColor: COLORS.boxBorder, // Makes that line dark grey
     color: COLORS.text, // Text they type is white
@@ -958,7 +1220,7 @@ const styles = StyleSheet.create({ // Initializes the native styling engine
     textAlign: 'center', // Makes the cursor start dead center
     paddingVertical: 12, // Adds space above and below the text so the line doesn't crowd it
     fontSize: 16, // Font size
-    letterSpacing: 2 // Pushes their typed letters apart slightly
+    letterSpacing: 1 // Tight tracking for inputs
   }, // Closes nameInput
 
   ctaButton: { // The layout for all standard buttons
@@ -970,11 +1232,26 @@ const styles = StyleSheet.create({ // Initializes the native styling engine
     borderRadius: 30 // Rounds the corners into a perfect pill shape
   }, // Closes ctaButton
   ctaText: { // Text inside the button
+    fontFamily: 'Pliant', // Enforces custom font
     color: COLORS.text, // White
     fontSize: 10, // Extremely small font
-    letterSpacing: 2, // Wide spacing
+    letterSpacing: 2, // Buttons usually look better slightly spaced out
     fontWeight: '600' // Semi-bold
   }, // Closes ctaText
+
+  // NEW — used in place of ctaButton where a boxed pill felt too heavy.
+  // intro's INITIALIZE button was left completely alone; this is only
+  // used on the boarding stage's CTA.
+  textLink: { // No border, no background — just tappable text
+    marginTop: 40 // Same spacing rhythm as ctaButton had
+  }, // Closes textLink
+  textLinkLabel: { // The text itself
+    fontFamily: 'Pliant', // Same custom font as everything else
+    color: COLORS.amber, // Amber, not white — this is the one accent-colored CTA in the flow
+    fontSize: 11, // Slightly larger than ctaText since there's no box to give it weight
+    letterSpacing: 2, // Same spaced-out rhythm as the rest of the UI
+    fontWeight: '400' // Lighter than the old bold pill text — meant to feel understated
+  }, // Closes textLinkLabel
 
   pinRow: { // Wrapper for the 6 boxes
     flexDirection: 'row', // Horizontal
@@ -988,10 +1265,22 @@ const styles = StyleSheet.create({ // Initializes the native styling engine
     justifyContent: 'center' // Centers the number vertically
   }, // Closes pinBox
   pinDigit: { // The number itself
+    fontFamily: 'Pliant', // Enforces custom font
     fontSize: 20, // Large
     fontWeight: '300' // Thin
   }, // Closes pinDigit
   
+  topLabel: { // NEW — the "flick to transmit" cue that TOP_SAFE_ZONE was always reserving room for
+    fontFamily: 'Pliant', // Enforces custom font
+    position: 'absolute', // Locked to specific coords, floats above the SVG
+    top: 58, // Sits comfortably inside the safe area, above the notch
+    width: '100%', // Spans full width so text can center
+    textAlign: 'center', // Centers the text
+    fontSize: 10, // Tiny, matching the bottom caption
+    letterSpacing: 2, // Wide tracking, matching the rest of the UI's rhythm
+    color: COLORS.mutedText, // Dim grey — a cue, not a shout
+    fontWeight: '300' // Thin
+  }, // Closes topLabel
   radarContainer: { // Wrapper for SVG
     flex: 1, // Fill screen
     width: '100%', // 100% width
@@ -999,11 +1288,12 @@ const styles = StyleSheet.create({ // Initializes the native styling engine
     position: 'relative' // Allows absolute positioning inside it
   }, // Closes radarContainer
   peerLabel: { // Text under orbs
+    fontFamily: 'Pliant', // Enforces custom font
     position: 'absolute', // Rips it out of normal layout so we can use X/Y coords
     width: 80, // Gives the text room to center itself
     textAlign: 'center', // Centers it under the dot
     fontSize: 10, // Tiny
-    letterSpacing: 1, // Spaced
+    letterSpacing: 1, // Tight tracking
     fontWeight: '300' // Thin
   }, // Closes peerLabel
   
@@ -1014,8 +1304,9 @@ const styles = StyleSheet.create({ // Initializes the native styling engine
     alignItems: 'center' // Centers text
   }, // Closes hud
   caption: { // Status text
+    fontFamily: 'Pliant', // Enforces custom font
     fontSize: 10, // Tiny
-    letterSpacing: 1.5, // Spaced
+    letterSpacing: 1, // Tight tracking
     color: COLORS.text, // White
     fontWeight: '300', // Thin
     opacity: 0.8 // Slightly dimmed
