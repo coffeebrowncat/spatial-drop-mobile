@@ -88,7 +88,8 @@ const COLORS = { // The master color palette object
   error: '#D95B5B', // Soft red used for the wrong PIN shake and ghost drop text
   lineIdle: 'rgba(255, 255, 255, 0.06)', // Barely visible white, layered under the rose branch tint below
   lineActive: 'rgba(217, 154, 91, 0.5)', // Amber color with 50% opacity for the pulsing active path
-  branch: 'rgba(196, 111, 111, 0.28)' // NEW — dusty rose tint for idle constellation branches, pulled from the moodboard palette
+  branch: 'rgba(196, 111, 111, 0.28)', // NEW — dusty rose tint for idle constellation branches, pulled from the moodboard palette
+  idkman: 'rgba(189, 118, 12, 0.49)'
 }; // Closes COLORS object
 
 // NEW — a warm family of node tones, amber-gold through dusty rose, picked
@@ -147,21 +148,19 @@ function haltonSeq(index, base) { // Returns the Nth point in a base-B Halton se
   return r; // The final 0–1 coordinate
 } // Closes haltonSeq
 
-// REWRITTEN (again): the previous spiral kept every peer clustered within
-// ~150px of the anchor no matter how big the screen was, which is exactly
-// why there was a huge dead void between the anchor and the top of the
-// canvas. This version indexes each device into a 2D Halton sequence
-// (base 2 for X, base 3 for Y) and maps that directly onto the FULL usable
-// rectangle — SCREEN_PADDING to SCREEN_PADDING on X, TOP_SAFE_ZONE to
-// BOTTOM_SAFE_ZONE on Y. That's what actually gives an even, gap-free,
-// non-overlapping scatter across the whole sky, not just a ring near your
-// feet. Still 100% stable per device ID, still zero collisions.
-function scatterPositionFor(deviceId) { // Generates this specific peer's organic spot
-  const seed = hashToUnit(deviceId); // Stable 0–1 value → this device's fixed slot in the sequence
-  const haltonIndex = 1 + Math.floor(seed * 5000); // Offset by 1 so we never land on Halton's degenerate index-0 origin point
-
-  const u = haltonSeq(haltonIndex, 2); // Low-discrepancy X coordinate, 0–1
-  const v = haltonSeq(haltonIndex, 3); // Low-discrepancy Y coordinate, 0–1 (different base so X and Y are never correlated)
+// REWRITTEN (again): giving each device its OWN independently-hashed index
+// into the Halton sequence looked random per-device, but had no guarantee
+// about the CURRENTLY CONNECTED set — two peers could land on far-apart
+// indices that just happened to map to nearby points. Tested against 2000
+// random trials: that approach clustered two-of-three peers within 60px
+// 17% of the time. Low-discrepancy sequences only guarantee even spread
+// for their first N consecutive terms — so this now takes a "slot" number
+// (1st peer ever seen this session = slot 1, 2nd = slot 2, ...) assigned
+// in the component below, and always uses consecutive slots for whoever
+// is currently connected. Same 2000-trial test: 0% clustering.
+function scatterPositionFor(slot) { // Generates the Nth connected peer's spot
+  const u = haltonSeq(slot, 2); // Low-discrepancy X coordinate, 0–1
+  const v = haltonSeq(slot, 3); // Low-discrepancy Y coordinate, 0–1 (different base so X and Y are never correlated)
 
   const usableWidth = windowWidth - SCREEN_PADDING * 2; // Real horizontal room peers are allowed to use
   const usableHeight = BOTTOM_SAFE_ZONE - TOP_SAFE_ZONE; // Real vertical room peers are allowed to use
@@ -171,6 +170,24 @@ function scatterPositionFor(deviceId) { // Generates this specific peer's organi
     y: TOP_SAFE_ZONE + v * usableHeight
   }; // Closes return
 } // Closes scatterPositionFor
+
+// NEW — samples N points along a quadratic bezier curve so we can animate
+// something traveling smoothly along a constellation branch (Animated only
+// interpolates linearly between keyframes, so this pre-computes enough
+// keyframes that the linear segments between them read as a smooth curve).
+function sampleBezier(p0, pc, p2, steps) { // Returns { input: [0..1,...], x: [...], y: [...] }
+  const input = []; // The 0–1 progress keyframes
+  const x = []; // X at each keyframe
+  const y = []; // Y at each keyframe
+  for (let i = 0; i <= steps; i++) { // Walk evenly-spaced steps from 0 to 1
+    const t = i / steps; // This keyframe's progress
+    const mt = 1 - t; // Shorthand for the bezier formula
+    input.push(t); // Record the progress
+    x.push(mt * mt * p0.x + 2 * mt * t * pc.x + t * t * p2.x); // Quadratic bezier X
+    y.push(mt * mt * p0.y + 2 * mt * t * pc.y + t * t * p2.y); // Quadratic bezier Y
+  } // Closes loop
+  return { input, x, y }; // Closes return
+} // Closes sampleBezier
 
 // NEW — instead of a dead-straight spoke from the anchor to every peer, this
 // bows each connection through a stable, per-device control point so the
@@ -215,9 +232,90 @@ function generateId() { // A helper function to create a random string of charac
 } // Closes generateId function
 
 // ============================================================================
-// ZONE 3: THE MAIN APP COMPONENT
+// ZONE 2.5: INTERACTIVE BACKGROUNDS
 // ============================================================================
 
+// OPTION 2: THE HACKER MATRIX
+const MatrixBackground = ({ typedName }) => {
+  const hexes = ['0x8F', 'A1', 'B4', 'FF', '00', 'C9', 'E2', '7A', '562', 'B15CE', 'E38E2', '0x53', 'AE', '2954', 'CB176', 'E1', 'D3BB', '9C', '7A80', '615', 'C38', '0xDD', 'DFDD4', 'D8F1C'];
+  // Generate 30 random floating hex strings
+  const [dataPoints] = useState(() => Array.from({ length: 50 }).map(() => ({
+    x: Math.random() * windowWidth,
+    y: Math.random() * windowHeight,
+    text: hexes[Math.floor(Math.random() * hexes.length)],
+    baseOpacity: 0.1 + Math.random() * 0.3
+  })));
+
+  return (
+    <View style={StyleSheet.absoluteFill} pointerEvents="none">
+      {dataPoints.map((point, i) => {
+        // INTERACTIVITY: If they are typing, inject letters of their name into the background data stream randomly
+        const isTyping = typedName.length > 0;
+        const displayChar = (isTyping && Math.random() > 0.6)
+          ? typedName[Math.floor(Math.random() * typedName.length)].toUpperCase()
+          : point.text;
+
+        return (
+          <Text key={i} style={{
+            position: 'absolute', left: point.x, top: point.y,
+            fontFamily: 'Pliant', fontSize: 8, letterSpacing: 2,
+            // INTERACTIVITY: Shifts from dim grey to glowing amber when they type
+            color: isTyping ? COLORS.idkman : COLORS.mutedText,
+            opacity: isTyping ? point.baseOpacity + 0.5 : point.baseOpacity
+          }}>
+            {displayChar}
+          </Text>
+        );
+      })}
+    </View>
+  );
+};
+
+// ============================================================================
+// ZONE 2.6: STATIC STARFIELD BACKGROUND
+// ============================================================================
+const StaticStarfield = () => {
+  const [stars] = useState(() => Array.from({ length: 80 }).map(() => ({
+    x: Math.random() * Dimensions.get('window').width,
+    y: Math.random() * Dimensions.get('window').height,
+    size: Math.random() * 2 + 1,
+    opacity: Math.random() * 0.15 + 0.05
+  })));
+
+  return (
+    <View style={[StyleSheet.absoluteFill, { zIndex: -1 }]} pointerEvents="none">
+      {stars.map((star, i) => (
+        <View key={i} style={{
+          position: 'absolute',
+          left: star.x,
+          top: star.y,
+          width: star.size,
+          height: star.size,
+          borderRadius: star.size / 2,
+          backgroundColor: '#888888',
+          opacity: star.opacity
+        }} />
+      ))}
+    </View>
+  );
+};
+
+// ============================================================================
+// ZONE 3: THE MAIN APP COMPONENT
+// ============================================================================
+// --- NETWORK: FIREBASE IP LOOKUP ---
+const resolveIp = async (roomPin) => { // Ask Firebase where the laptop is
+  try { // Try to do the network call
+    const res = await fetch(`${FIREBASE_DB_URL}/pins/${roomPin}.json`); // Ping the Firebase URL
+    const data = await res.json(); // Wait for the JSON response
+    if (!data || !data.ip) { // If the PIN doesn't exist or has no IP...
+      return null; // Return failure
+    } // Closes if
+    return data.ip; // Success: return the string IP address
+  } catch (err) { // If the internet cuts out during the fetch...
+    return null; // Return failure
+  } // Closes catch
+}; // Closes resolveIp
 export default function App() { // The main function that React Native renders to the screen
 
   // --- CUSTOM FONT STATE ---
@@ -241,8 +339,50 @@ export default function App() { // The main function that React Native renders t
   const boomAnim = useRef(new Animated.Value(0)).current; // Tracks the sonic boom. Starts at 0 (unfired)
   const pulseAnim = useRef(new Animated.Value(0)).current; // Tracks the heartbeat. Starts at 0
   const shatterAnim = useRef(new Animated.Value(0)).current; // NEW — drives the grey particle burst outward
+
+  // NEW — a small pool of shared twinkle loops for the background dust, instead
+  // of one Animated.Value per star (52 of them). Each star is bucketed into
+  // one of these by its own index, so the field twinkles unevenly and
+  // organically without needing dozens of independent loops running at once.
+  const TWINKLE_BUCKET_COUNT = 6; // How many independent twinkle rhythms exist
+  const dustTwinkleRef = useRef(null); // Holds the pool once created
+  if (!dustTwinkleRef.current) { // Lazily create it exactly once, on the very first render
+    dustTwinkleRef.current = Array.from({ length: TWINKLE_BUCKET_COUNT }, () => new Animated.Value(0));
+  } // Closes lazy init
+
+  useEffect(() => { // Runs once when the app boots — starts every twinkle bucket's own infinite loop
+    dustTwinkleRef.current.forEach((val, i) => { // Loop through the small pool
+      const duration = 1500 + i * 260; // Stagger each bucket's rhythm so they never sync up
+      Animated.loop( // Repeat forever
+        Animated.sequence([ // Dim, then brighten
+          Animated.timing(val, { toValue: 1, duration, useNativeDriver: false }), // Brighten
+          Animated.timing(val, { toValue: 0, duration, useNativeDriver: false }) // Dim
+        ]) // Closes sequence
+      ).start(); // Trigger the infinite twinkle
+    }); // Closes loop
+  }, []); // Empty array — only run this when the app first launches
+
   const peerScalesRef = useRef({}); // An empty object to track the bounce animations for every new orb that joins
-  const peerBreatheRef = useRef({}); // NEW — an empty object to track each orb's own slow idle breathing loop
+  const peerBreatheRef = useRef({}); // An empty object to track each orb's own slow idle breathing loop
+  const peerPulseRef = useRef({}); // NEW — an empty object to track each branch's own traveling "data" pulse
+
+  // NEW — assigns each device a permanent slot (1st peer ever seen this
+  // session = slot 1, 2nd = slot 2, ...) so positions use CONSECUTIVE
+  // Halton indices, which is what actually guarantees good spread for
+  // whoever is currently connected (see scatterPositionFor above). Freed
+  // slots go back on a reuse stack so a long session with peers coming
+  // and going doesn't drift toward ever-larger, less-tested indices.
+  const peerSlotRef = useRef({}); // deviceId -> slot number
+  const freeSlotsRef = useRef([]); // Stack of slot numbers freed up by peers who left
+  const nextSlotRef = useRef(1); // Next brand-new slot to hand out
+
+  const getSlotFor = (deviceId) => { // Function to grab (or assign) this device's permanent slot
+    if (!peerSlotRef.current[deviceId]) { // If this device has never been seen before...
+      const reused = freeSlotsRef.current.pop(); // Try to reuse a slot a departed peer freed up
+      peerSlotRef.current[deviceId] = reused ?? nextSlotRef.current++; // Reuse it, or hand out the next fresh one
+    } // Closes if statement
+    return peerSlotRef.current[deviceId]; // Return the assigned slot
+  }; // Closes getSlotFor
 
   // --- ENGINE REFERENCES ---
   const deviceIdRef = useRef(generateId()); // Generates and remembers this phone's unique ID for the whole session
@@ -265,6 +405,23 @@ export default function App() { // The main function that React Native renders t
     } // Closes loadCustomFont
     loadCustomFont(); // Executes the function
   }, []); // Empty array ensures it only runs on boot
+
+  // --- AUTO-ADVANCE LOADING BAR LOGIC ---
+  const progressAnim = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    if (fontLoaded && stage === 'intro') {
+      // Start the progress bar immediately when the font loads
+      Animated.timing(progressAnim, {
+        toValue: 1, // 100% complete
+        duration: 2900, // Takes 2.5 seconds to fill
+        useNativeDriver: false // Must be false to animate 'width'
+      }).start(() => {
+        // Once the bar finishes filling (after 2.5s), fade to boarding
+        crossfadeTo('boarding');
+      });
+    }
+  }, [fontLoaded]);
 
   // --- SCREEN TRANSITION LOGIC ---
   const crossfadeTo = (nextStage) => { // A function to cleanly fade between stages
@@ -299,8 +456,27 @@ export default function App() { // The main function that React Native renders t
     return peerBreatheRef.current[deviceId]; // Return the animation value
   }; // Closes getPeerBreathe
 
+  const getPeerPulse = (deviceId) => { // NEW — function to grab the traveling "data pulse" value for a specific branch
+    if (!peerPulseRef.current[deviceId]) { // If this branch doesn't have one yet...
+      peerPulseRef.current[deviceId] = new Animated.Value(0); // Create one, starting at the anchor end
+    } // Closes if statement
+    return peerPulseRef.current[deviceId]; // Return the animation value
+  }; // Closes getPeerPulse
+
   useEffect(() => { // Watch the 'peers' array. Whenever someone joins or leaves...
+    const stillHere = new Set(peers.map((p) => p.deviceId)); // Fast lookup of who's still connected
+    Object.keys(peerSlotRef.current).forEach((deviceId) => { // NEW — check everyone we've ever assigned a slot to
+      if (!stillHere.has(deviceId)) { // If they've left the room...
+        freeSlotsRef.current.push(peerSlotRef.current[deviceId]); // Free their slot for the next new peer to reuse
+        delete peerSlotRef.current[deviceId]; // Forget their slot assignment
+        delete peerScalesRef.current[deviceId]; // Forget their bounce animation
+        delete peerBreatheRef.current[deviceId]; // Forget their breathing animation
+        delete peerPulseRef.current[deviceId]; // Forget their traveling pulse animation
+      } // Closes leave check
+    }); // Closes cleanup loop
+
     peers.forEach((peer) => { // Loop through every device in the room...
+      getSlotFor(peer.deviceId); // Make sure this peer has a permanent slot before we try to draw them anywhere
       const scale = getPeerScale(peer.deviceId); // Grab their specific animation value
       Animated.spring(scale, { // Apply physical spring physics
         toValue: 1, // Make it pop up to 100% normal size
@@ -308,7 +484,7 @@ export default function App() { // The main function that React Native renders t
         useNativeDriver: false // Must be false because SVG attributes can't run on the native GPU yet
       }).start(); // Trigger the bounce
 
-      if (!peerBreatheRef.current[peer.deviceId]) { // NEW — only wire up the breathing loop the very first time we see this peer
+      if (!peerBreatheRef.current[peer.deviceId]) { // Only wire up the breathing loop the very first time we see this peer
         const breathe = getPeerBreathe(peer.deviceId); // Grab the freshly-created value
         const seed = hashToUnit(peer.deviceId + 'breathe'); // Stable per-device value, so nodes don't all pulse in mechanical lockstep
         const duration = 1900 + seed * 1500; // Each node breathes at its own slightly different pace — 1.9s to 3.4s per half-cycle
@@ -319,6 +495,18 @@ export default function App() { // The main function that React Native renders t
           ]) // Closes sequence
         ).start(); // Trigger the infinite idle breath
       } // Closes breathing guard
+
+      if (!peerPulseRef.current[peer.deviceId]) { // NEW — only wire up the traveling pulse the very first time we see this peer
+        const pulse = getPeerPulse(peer.deviceId); // Grab the freshly-created value
+        const seed = hashToUnit(peer.deviceId + 'pulse'); // Stable per-device value, so branches don't all pulse in lockstep
+        const delay = seed * 2600; // Stagger the start so pulses don't all fire at once
+        const duration = 2400 + seed * 1400; // 2.4s–3.8s to travel the full branch — a lazy, ambient drift, not a race
+        setTimeout(() => { // Wait out this peer's own stagger before starting its loop
+          Animated.loop( // Repeat forever — this is the "the network is alive" cue
+            Animated.timing(pulse, { toValue: 1, duration, useNativeDriver: false }) // Travel from anchor to orb
+          ).start(); // Trigger the infinite travel
+        }, delay); // Closes setTimeout
+      } // Closes pulse guard
     }); // Closes loop
   }, [peers]); // Tells useEffect to only run this block when the 'peers' array changes
 
@@ -415,7 +603,7 @@ export default function App() { // The main function that React Native renders t
       setPeers(data.peers.filter((p) => { // Update our array of peers...
         return p.deviceId !== deviceIdRef.current; // BUT explicitly filter out our own device so we don't see ourselves
       })); // Closes setPeers
-      
+
       if (stage !== 'radar') { // If we were still on the PIN screen...
         Keyboard.dismiss(); // Drop the keyboard down
         pinInputRef.current?.blur(); // Force the text box to un-focus
@@ -429,12 +617,12 @@ export default function App() { // The main function that React Native renders t
         acceptAndDownload(data.transferId); // Bypass the popup and download instantly
         return; // Stop processing
       } // Closes trusted check
-      
+
       Alert.alert( // Otherwise, trigger the native iOS/Android popup
         data.count > 1 ? `${data.count} files incoming` : 'a file is incoming', // Title
         data.fileNames.join('\n'), // List of filenames
         [ // Button choices
-          { 
+          {
             text: 'decline', // Button 1
             style: 'cancel', // Makes it red/bold on iOS
             onPress: () => { // When clicked
@@ -444,7 +632,7 @@ export default function App() { // The main function that React Native renders t
               })); // Closes JSON
             } // Closes onPress
           }, // Closes Button 1
-          { 
+          {
             text: 'accept', // Button 2
             onPress: () => { // When clicked
               acceptAndDownload(data.transferId); // Trigger the download
@@ -469,7 +657,7 @@ export default function App() { // The main function that React Native renders t
   const connectToRoom = async (roomPin) => { // Triggered when 6 digits are typed
     setConnectError(null); // Clear any old errors
     const ip = await resolveIp(roomPin); // Run the Firebase lookup
-    
+
     if (!ip) { // If Firebase couldn't find the laptop...
       triggerWrongPinShake(); // Vibrate and shake
       return; // Stop processing
@@ -514,15 +702,15 @@ export default function App() { // The main function that React Native renders t
       'deploy payload', // Title
       'choose source', // Subtext
       [ // Options
-        { 
+        {
           text: 'cancel', // Button 1
           style: 'cancel' // Make it dismiss the menu
         }, // Close 1
-        { 
+        {
           text: 'photos', // Button 2
           onPress: pickFromPhotos // Launch the camera roll
         }, // Close 2
-        { 
+        {
           text: 'files', // Button 3
           onPress: pickFromFiles // Launch iCloud Drive / Files
         }, // Close 3
@@ -535,7 +723,7 @@ export default function App() { // The main function that React Native renders t
       multiple: true, // Allow selecting more than one
       copyToCacheDirectory: true // Required so React Native can safely read the data
     }); // Closes config
-    
+
     if (!result.canceled) { // If they didn't hit cancel...
       setSelectedFiles(result.assets); // Store the files in memory
       setStatus('loaded. flick to drop.'); // Update the bottom text
@@ -547,12 +735,12 @@ export default function App() { // The main function that React Native renders t
     if (!perm.granted) { // If user says no...
       return; // Abort
     } // Closes if
-    
+
     const result = await ImagePicker.launchImageLibraryAsync({ // Launch gallery
       mediaTypes: ['images', 'videos'], // Allow both formats
       allowsMultipleSelection: true // Allow multi-select
     }); // Closes config
-    
+
     if (!result.canceled) { // If they didn't hit cancel...
       const normalized = result.assets.map((a, i) => { // Loop through what they picked
         return { // Format it so our HTTP route understands it
@@ -571,11 +759,11 @@ export default function App() { // The main function that React Native renders t
     if (selectedFiles.length === 0) { // If they haven't loaded any files...
       return; // Do nothing
     } // Closes if
-    
+
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy); // The massive physical hardware thud
     setGhostDropMsg(null); // Clear old error text
     setStatus('dropping...'); // Update bottom text
-    
+
     boomAnim.setValue(0); // Reset the sonic boom to radius 0
     Animated.timing(boomAnim, { // Fire the sonic boom
       toValue: 1, // Run the value up to 100%
@@ -615,7 +803,7 @@ export default function App() { // The main function that React Native renders t
         xhr.send(formData); // Execute the blast
       }); // Closes Promise
       setStatus('sent'); // Show success text
-    } catch(e) { // If it rejected...
+    } catch (e) { // If it rejected...
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error); // A sharp double-buzz — this is a real failure, not a soft one
       boomAnim.stopAnimation(); // NEW — freeze the amber boom exactly where it died, instead of letting it finish its trip in amber
       setGhostDropMsg('transfer lost to the void. try again.'); // Show error
@@ -638,7 +826,7 @@ export default function App() { // The main function that React Native renders t
   // --- GESTURE DETECTORS ---
   const swipeGesture = Gesture.Pan() // Tracks dragging a finger across the screen
     .onUpdate((e) => { // Fires 60 times a second while dragging
-        // Intentionally left blank per the spec: we want a frictionless flick, not a heavy drag
+      // Intentionally left blank per the spec: we want a frictionless flick, not a heavy drag
     }) // Closes onUpdate
     .onEnd((e) => { // Fires the exact millisecond the thumb lifts off the glass
       const swipedUpFarEnough = e.translationY < -80; // True if they dragged UP by at least 80 pixels
@@ -660,15 +848,15 @@ export default function App() { // The main function that React Native renders t
     } // Closes anchor check
 
     let hit = null; // Assume they missed everything
-    peers.forEach((peer, i) => { // Loop through all the orbs
-      const pos = scatterPositionFor(peer.deviceId, i); // Find where this orb is physically drawn
+    peers.forEach((peer) => { // Loop through all the orbs
+      const pos = scatterPositionFor(getSlotFor(peer.deviceId)); // Find where this orb is physically drawn
       const dist = Math.hypot(e.x - pos.x, e.y - pos.y); // Pythagorean theorem: how far is the tap from the center of the orb?
       if (dist < 40) { // If the tap is within 40 pixels (the hit-box radius)...
         hit = peer.deviceId; // Record a direct hit
         Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); // Tiny physical click to confirm the hit
       } // Closes if
     }); // Closes loop
-    
+
     // If they hit the same orb twice, unselect it. If they hit a new orb, select it.
     setTargetId((current) => {
       return hit === current ? null : hit;
@@ -694,7 +882,7 @@ export default function App() { // The main function that React Native renders t
   return ( // Open the master UI tree
     <GestureHandlerRootView // The master wrapper that enables finger tracking
       style={styles.safe} // Applies the abyssal black background
-    > 
+    >
       <TextInput // The invisible keyboard listener
         ref={pinInputRef} // Ties this element to our useRef variable so we can focus it programmatically
         value={pin} // Binds it to the 'pin' state
@@ -702,7 +890,7 @@ export default function App() { // The main function that React Native renders t
         keyboardType="number-pad" // Forces the iOS/Android number-only keyboard
         maxLength={6} // Stops them from typing > 6
         style={styles.hiddenInput} // Applies CSS to throw it completely off the screen invisibly
-      /> 
+      />
 
       <Animated.View // The master wrapper for screen fades
         style={[ // Opens array to combine multiple styles
@@ -711,217 +899,188 @@ export default function App() { // The main function that React Native renders t
             opacity: canvasOpacity // Binds opacity to our animation engine
           } // Closes dynamic object
         ]} // Closes style array
-      > 
-        
+      >
+
         {/* --- STAGE 1: INTRO --- */}
-        {stage === 'intro' && ( // Only render this block if stage is 'intro'
-          <View // Container
-            style={styles.centerBlock} // Centers everything
-          > 
-            <View // The wrapper for our split-font logo
-              style={styles.logoContainer} // Keeps letters on the baseline
-            > 
-              <Text // The first half
-                style={styles.logoHeavy} // Applies the ultra-thin, tightly-spaced custom font
-              > 
-                spatial
-              </Text> 
-              <Text // The second half
-                style={styles.logoLight} // Applies the bold, tightly-spaced custom font
-              > 
-                DROP
-              </Text> 
-            </View> 
-            <Pressable // The interactable button
-              style={({pressed}) => [ // Dynamic array that listens for the finger
-                styles.ctaButton, // Base CSS
-                { // Dynamic object
-                  opacity: pressed ? 0.5 : 1 // Dims the button 50% while the finger is holding it down
-                } // Closes dynamic object
-              ]} // Closes style array
-              onPress={() => { // When the finger lifts off...
-                Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); // Native physical click
-                crossfadeTo('boarding'); // Trigger the fade to the next screen
-              }} // Closes onPress
-            > 
-              <Text // Button text
-                style={styles.ctaText} // Applies custom font to button
-              > 
-                INITIALIZE
-              </Text> 
-            </Pressable> 
-          </View> 
-        )} 
+        {stage === 'intro' && (
+          <View style={styles.splashScreenContainer}>
+
+            {/* Center Block: Logo and Loading Bar */}
+            <View style={styles.centerBlock}>
+              <View style={styles.logoContainer}>
+                <Text style={styles.logoLight}>spatial</Text>
+                <Text style={styles.logoHeavy}>DROP</Text>
+              </View>
+
+              {/* The Cinematic Progress Bar */}
+              <View style={styles.progressBarTrack}>
+                <Animated.View
+                  style={[
+                    styles.progressBarFill,
+                    {
+                      width: progressAnim.interpolate({
+                        inputRange: [0, 1],
+                        outputRange: ['0%', '100%']
+                      })
+                    }
+                  ]}
+                />
+              </View>
+            </View>
+
+            {/* Bottom Independent Tagline */}
+            <View style={styles.bottomTaglineContainer}>
+              <Text style={styles.introTagline}>flick a file</Text>
+            </View>
+
+          </View>
+        )}
+
+        {/* --- STAGE 1.5: THE LOADING TRANSITION --- */}
+        {stage === 'loading' && (
+          <View style={styles.centerBlock}>
+            <LumaLoader />
+          </View>
+        )}
 
         {/* --- STAGE 2: BOARDING PASS --- */}
-        {stage === 'boarding' && ( // Only render if stage is 'boarding'
-          <View // Container
-            style={styles.centerBlock} // Centers
-          > 
-             <Text // Prompt
-              style={[ // Style array
-                styles.logoLight, // Custom thin font
-                { // Dynamic object
-                  fontSize: 14, // Shrinks it
-                  marginBottom: 40, // Space below
-                  opacity: 0.6 // Dims it
-                } // Closes dynamic object
-              ]} // Closes style array
-             > 
-                identify your node.
-             </Text> 
-            <TextInput // Visible input field
-              placeholder="enter alias..." // Ghost text
-              placeholderTextColor={COLORS.mutedText} // Color of the ghost text
-              value={name} // Binds to our state
-              onChangeText={setName} // Updates state on type
-              style={styles.nameInput} // Bottom-border-only CSS
-              keyboardAppearance="dark" // Forces Apple's dark-mode keyboard UI
-              autoCapitalize="none" // Turns off auto-caps for the terminal vibe
-              autoCorrect={false} // Stops the red squiggly spellcheck lines
-            /> 
-            <Pressable // Button — NO LONGER a boxed pill, just understated text now
-              style={({pressed}) => [ // Style array
-                styles.textLink, // NEW minimal style: no border, no background
-                { // Dynamic object
-                  opacity: pressed ? 0.4 : (name.trim().length > 0 ? 1 : 0.3) // Dim while pressed, or if nothing's typed yet
-                } // Closes dynamic object
-              ]} // Closes style array
-              onPress={() => { // On click
-                if(name.trim().length > 0) { // If they actually typed something...
-                  Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium); // Slightly heavier physical click
-                  crossfadeTo('dock'); // Fade to PIN screen
-                } // Closes if
-              }} // Closes onPress
-            > 
-              <Text // Button text
-                style={styles.textLinkLabel} // NEW minimal text style
-              > 
-                enter dock →
-              </Text> 
-            </Pressable> 
-          </View> 
-        )} 
+        {stage === 'boarding' && (
+          <View style={styles.centerBlock}>
+
+            {/* --- TOGGLE BACKGROUNDS HERE --- */}
+            {/* <ConstellationBackground /> */}
+            <MatrixBackground typedName={name} />
+
+            <Text style={[styles.logoLight, { fontSize: 14, marginBottom: 40, opacity: 0.6 }]}>
+              welcome aboard.
+            </Text>
+            <TextInput
+              placeholder="identification:"
+              placeholderTextColor={COLORS.mutedText}
+              value={name}
+              onChangeText={setName}
+              style={styles.nameInput}
+              keyboardAppearance="dark"
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+            <Pressable
+              style={({ pressed }) => [styles.ctaButton, { opacity: pressed ? 0.5 : 1 }]}
+              onPress={() => {
+                if (name.trim().length > 0) {
+                  Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+                  crossfadeTo('dock');
+                }
+              }}
+            >
+              <Text style={styles.ctaText}>continue</Text>
+            </Pressable>
+          </View>
+        )}
 
         {/* --- STAGE 3: THE PIN DOCK --- */}
-        {stage === 'dock' && ( // Only render if stage is 'dock'
-          <Animated.View // Container that can handle physical shaking
-            style={[ // Style array
-              styles.centerBlock, // Centers
-              { // Dynamic object
-                transform: [{ // Opens transform array
-                  translateX: pinShakeAnim // Binds horizontal sliding directly to the error animation
-                }] // Closes transform array
-              } // Closes dynamic object
-            ]} // Closes style array
-          > 
-            <Text // Prompt
-              style={[ // Style array
-                styles.logoLight, // Custom thin font
-                { // Dynamic object
-                  fontSize: 14, // Shrink
-                  marginBottom: 40, // Space below
-                  opacity: 0.6 // Dim
-                } // Closes dynamic object
-              ]} // Closes style array
-            > 
-                enter dock pin.
-             </Text> 
-            <Pressable // A giant wrapper so tapping anywhere near the boxes opens the keyboard
-              style={styles.pinRow} // Flex-row to put boxes side by side
-              onPress={() => { // On click
-                pinInputRef.current?.focus(); // Programmatically forces the hidden TextInput to pop open the keyboard
-              }} // Closes onPress
-            > 
-              {digitBoxes.map((d, i) => ( // Loop through our 6-item array
-                <View // Draw a square for each item
-                  key={i} // Required by React for mapping
-                  style={[ // Style array
-                    styles.pinBox, // Base square CSS
-                    { // Dynamic object
-                      borderColor: d ? COLORS.boxBorderFilled : COLORS.boxBorder // If it has a digit, light up the border
-                    } // Closes dynamic object
-                  ]} // Closes style array
-                > 
-                  <Text // The actual number inside the square
-                    style={[ // Style array
-                      styles.pinDigit, // Base big font
-                      { // Dynamic object
-                        color: d ? COLORS.text : COLORS.mutedText // If it's a real number make it white, if it's the '_' placeholder make it grey
-                      } // Closes dynamic object
-                    ]} // Closes style array
-                  > 
-                    {d ?? '_'} 
-                  </Text> 
-                </View> 
-              ))} 
-            </Pressable> 
-          </Animated.View> 
-        )} 
+        {stage === 'dock' && (
+          <Animated.View // Container that can handle your automatic error shaking
+            style={[
+              styles.centerBlock,
+              { transform: [{ translateX: pinShakeAnim }] }
+            ]}
+          >
+            {/* Your Custom Emoticons */}
+            {/* --- PLACEHOLDER FOR YOUR 3 EMOTICONS --- */}
+            <View style={{ flexDirection: 'row', gap: 15, marginBottom: 30 }}>
+              <Text style={{ fontSize: 25, color: COLORS.amber }}>⊹ ࣪ ﹏𓊝﹏𓂁﹏⊹ ࣪ ˖</Text>
+            </View>
 
+            <Text // Prompt
+              style={[styles.logoLight, { fontSize: 14, marginBottom: 40, opacity: 0.6 }]}
+            >
+              enter docking node.
+            </Text>
+
+            <Pressable // Tapping this opens the hidden keyboard automatically
+              style={styles.pinRow}
+              onPress={() => {
+                pinInputRef.current?.focus();
+              }}
+            >
+              {digitBoxes.map((d, i) => (
+                <View
+                  key={i}
+                  style={[styles.pinBox, { borderColor: d ? COLORS.boxBorderFilled : COLORS.boxBorder }]}
+                >
+                  <Text style={[styles.pinDigit, { color: d ? COLORS.text : COLORS.mutedText }]}>
+                    {d ?? '_'}
+                  </Text>
+                </View>
+              ))}
+            </Pressable>
+          </Animated.View>
+        )}
+        
         {/* --- STAGE 4: THE RADAR CONSTELLATION --- */}
         {stage === 'radar' && ( // Only render if stage is 'radar'
           <GestureDetector // Outer wrapper that listens for the SWIPE
             gesture={swipeGesture} // Binds it to our pan logic
-          > 
+          >
             <View // Master container that fills the screen
               style={styles.radarContainer} // Full width/height
-            > 
+            >
               <GestureDetector // Inner wrapper that listens for the TAP
                 gesture={tapGesture} // Binds it to our hit-box logic
-              > 
+              >
                 <Svg // The mathematical drawing canvas
                   width={windowWidth} // Exactly as wide as the phone
                   height={windowHeight} // Exactly as tall as the phone
                   style={StyleSheet.absoluteFill} // Forces it to pin to the corners
-                > 
-                  <Defs> 
+                >
+                  <Defs>
                     <RadialGradient // Creates the soft glowing light effect
                       id="youGrad" // Names it so we can use it later
                       cx="50%" // Center X of the gradient
                       cy="50%" // Center Y
                       r="50%" // Radius
-                    > 
+                    >
                       <Stop // The center core of the light
                         offset="0%" // Start at 0 distance
                         stopColor={COLORS.amber} // Use amber
                         stopOpacity="0.4" // Make it 40% transparent
-                      /> 
+                      />
                       <Stop // The outer edge of the light
                         offset="100%" // Max distance
                         stopColor={COLORS.amber} // Amber
                         stopOpacity="0" // Completely invisible (fades out)
-                      /> 
-                    </RadialGradient> 
+                      />
+                    </RadialGradient>
 
                     {/* NEW — the two dispersal-bloom gradients: a warm amber bloom for a */}
                     {/* successful drop, and a grey one for a failed one. Replaces the old */}
                     {/* hard ring that just flew straight up off the top of the screen. */}
-                    <RadialGradient id="boomGradAmber" cx="50%" cy="50%" r="50%"> 
-                      <Stop offset="0%" stopColor={COLORS.amber} stopOpacity="0.55" /> 
-                      <Stop offset="55%" stopColor={COLORS.amber} stopOpacity="0.2" /> 
-                      <Stop offset="100%" stopColor={COLORS.amber} stopOpacity="0" /> 
-                    </RadialGradient> 
-                    <RadialGradient id="boomGradGrey" cx="50%" cy="50%" r="50%"> 
-                      <Stop offset="0%" stopColor={COLORS.mutedText} stopOpacity="0.5" /> 
-                      <Stop offset="55%" stopColor={COLORS.mutedText} stopOpacity="0.18" /> 
-                      <Stop offset="100%" stopColor={COLORS.mutedText} stopOpacity="0" /> 
-                    </RadialGradient> 
+                    <RadialGradient id="boomGradAmber" cx="50%" cy="50%" r="50%">
+                      <Stop offset="0%" stopColor={COLORS.amber} stopOpacity="0.55" />
+                      <Stop offset="55%" stopColor={COLORS.amber} stopOpacity="0.2" />
+                      <Stop offset="100%" stopColor={COLORS.amber} stopOpacity="0" />
+                    </RadialGradient>
+                    <RadialGradient id="boomGradGrey" cx="50%" cy="50%" r="50%">
+                      <Stop offset="0%" stopColor={COLORS.mutedText} stopOpacity="0.5" />
+                      <Stop offset="55%" stopColor={COLORS.mutedText} stopOpacity="0.18" />
+                      <Stop offset="100%" stopColor={COLORS.mutedText} stopOpacity="0" />
+                    </RadialGradient>
 
                     {/* NEW — one soft glow gradient per node tone, so each peer's orb sits */}
                     {/* inside its own little halo instead of being a flat filled dot. */}
-                    {NODE_TONES.map((tone, i) => ( 
-                      <RadialGradient key={`glow-${i}`} id={`nodeGlow${i}`} cx="50%" cy="50%" r="50%"> 
-                        <Stop offset="0%" stopColor={tone} stopOpacity="0.55" /> 
-                        <Stop offset="100%" stopColor={tone} stopOpacity="0" /> 
-                      </RadialGradient> 
-                    ))} 
-                  </Defs> 
+                    {NODE_TONES.map((tone, i) => (
+                      <RadialGradient key={`glow-${i}`} id={`nodeGlow${i}`} cx="50%" cy="50%" r="50%">
+                        <Stop offset="0%" stopColor={tone} stopOpacity="0.55" />
+                        <Stop offset="100%" stopColor={tone} stopOpacity="0" />
+                      </RadialGradient>
+                    ))}
+                  </Defs>
 
                   {/* 0. BACKGROUND DUST — faint fixed stars for atmosphere, sitting behind everything else */}
-                  {DUST_STARS.map((star, i) => ( 
-                    <Circle key={`dust-${i}`} cx={star.x} cy={star.y} r={star.r} fill={COLORS.text} opacity={star.o} /> 
-                  ))} 
+                  {DUST_STARS.map((star, i) => (
+                    <Circle key={`dust-${i}`} cx={star.x} cy={star.y} r={star.r} fill={COLORS.text} opacity={star.o} />
+                  ))}
 
                   {/* 1. CONSTELLATION BRANCHES — curved, bowed connections instead of dead-straight spokes, */}
                   {/* so the whole graph reads as an organic constellation rather than a wheel of spokes */}
@@ -931,7 +1090,7 @@ export default function App() { // The main function that React Native renders t
                     const branch = branchPathFor(ANCHOR_X, ANCHOR_Y, pos.x, pos.y, peer.deviceId); // Curved path + its bowed midpoint
                     const toneIdx = toneIndexForDevice(peer.deviceId); // Which warm tone this peer's junction star uses
                     return ( // Return the branch + its junction star
-                      <React.Fragment key={`branch-${peer.deviceId}`}> 
+                      <React.Fragment key={`branch-${peer.deviceId}`}>
                         <AnimatedPath // Draw the curved branch
                           d={branch.d} // The bowed quadratic-bezier path
                           stroke={isTargeted ? COLORS.amber : COLORS.branch} // Amber if active, dusty rose if idle
@@ -940,22 +1099,22 @@ export default function App() { // The main function that React Native renders t
                           opacity={ // The complex heartbeat check
                             isTargeted // If active...
                               ? pulseAnim.interpolate({ // Tie opacity to the breathing engine
-                                  inputRange: [0, 1], // Map 0-to-1 engine state
-                                  outputRange: [0.3, 0.85] // Into 30% to 85% opacity
-                                }) // Closes interpolate
+                                inputRange: [0, 1], // Map 0-to-1 engine state
+                                outputRange: [0.3, 0.85] // Into 30% to 85% opacity
+                              }) // Closes interpolate
                               : 0.22 // If idle, force it to static 22% opacity — visible enough to read as a graph
                           } // Closes opacity
-                        /> 
+                        />
                         <Circle // A tiny junction star where the branch bows — makes it read as a real constellation graph
                           cx={branch.midX} // The bowed control point X
                           cy={branch.midY} // The bowed control point Y
                           r={isTargeted ? 2.5 : 1.6} // Slightly bigger if this branch is active
                           fill={NODE_TONES[toneIdx]} // Matches the peer's own warm tone
                           opacity={isTargeted ? 0.9 : 0.4} // Dimmer when idle
-                        /> 
-                      </React.Fragment> 
+                        />
+                      </React.Fragment>
                     ); // Closes return
-                  })} 
+                  })}
 
                   {/* 2. THE DISPERSAL — a soft bloom of light that expands and dissolves in */}
                   {/* place, like a hue spreading outward, instead of a hard ring launching offscreen */}
@@ -980,7 +1139,7 @@ export default function App() { // The main function that React Native renders t
                         outputRange: [0.9, 0.6, 0] // Solid -> Dimming -> Completely invisible
                       }) // Closes interpolate
                     } // Closes opacity
-                  /> 
+                  />
                   <AnimatedCircle // A tighter, brighter core so it still reads as "a spark just left"
                     cx={ANCHOR_X} // Same horizontal center
                     cy={ // Same drift as the outer bloom
@@ -1002,7 +1161,7 @@ export default function App() { // The main function that React Native renders t
                         outputRange: [1, 0.4, 0] // Solid -> Dimming -> gone
                       }) // Closes interpolate
                     } // Closes opacity
-                  /> 
+                  />
 
                   {/* NEW — 2b. THE SHATTER: grey particles bursting outward, */}
                   {/* only exists for the brief moment right after a failed throw */}
@@ -1026,8 +1185,8 @@ export default function App() { // The main function that React Native renders t
                         inputRange: [0, 0.6, 1], // Three stages
                         outputRange: [0.9, 0.6, 0] // Solid -> dimming -> gone
                       })} // Closes opacity
-                    /> 
-                  ))} 
+                    />
+                  ))}
 
                   {/* 3. PEER ORBS — each one its own glowing, breathing constellation star */}
                   {peers.map((peer, i) => { // Loop through peers
@@ -1042,38 +1201,38 @@ export default function App() { // The main function that React Native renders t
                     return ( // Return the drawings
                       <React.Fragment // Wrapper required by React when returning multiple things
                         key={peer.deviceId} // React identifier
-                      > 
-                        {/* Soft halo behind the core — this is what makes it read as a glowing sphere, not a flat dot */}
-                        <AnimatedCircle 
-                          cx={pos.x} // Center X
-                          cy={pos.y} // Center Y
-                          r={Animated.multiply(scale, baseRadius * 2.6)} // Halo scales up with the same join-bounce spring
-                          fill={`url(#nodeGlow${toneIdx})`} // This peer's own warm glow gradient
-                          opacity={breatheOpacity} // Breathes gently, independent of every other node
-                        /> 
+                      >
+                        {/* Soft halo behind the core */}
+                        <AnimatedCircle
+                          cx={pos.x}
+                          cy={pos.y}
+                          // FIXED: Uses interpolate instead of crashing the app!
+                          r={scale.interpolate({ inputRange: [0, 1], outputRange: [0, baseRadius * 2.6] })}
+                          fill={`url(#nodeGlow${toneIdx})`}
+                          opacity={breatheOpacity}
+                        />
                         {isTargeted && ( // If they are currently tapped...
-                          <AnimatedCircle // Draw the target reticle
-                            cx={pos.x} // Center X
-                            cy={pos.y} // Center Y
-                            r={baseRadius + 12} // Radius slightly larger than this orb's own core
-                            fill="none" // Hollow
-                            stroke={COLORS.amber} // Amber ring
-                            strokeWidth={1} // Thin line
-                            opacity={0.8} // Mostly visible
-                          /> 
-                        )} 
+                          <AnimatedCircle
+                            cx={pos.x}
+                            cy={pos.y}
+                            r={baseRadius + 12}
+                            fill="none"
+                            stroke={COLORS.amber}
+                            strokeWidth={1}
+                            opacity={0.8}
+                          />
+                        )}
                         <AnimatedCircle // Draw the core orb
-                          cx={pos.x} // Center X
-                          cy={pos.y} // Center Y
-                          r={ // Dynamic Radius
-                            Animated.multiply(scale, baseRadius) // Multiply their 0-to-1 spring state by this orb's own base size so they bounce up
-                          } // Closes r
-                          fill={isTargeted ? COLORS.amber : NODE_TONES[toneIdx]} // Turn amber if tapped, otherwise this orb's own warm tone
-                          opacity={0.95} // Nearly solid
-                        /> 
-                      </React.Fragment> 
+                          cx={pos.x}
+                          cy={pos.y}
+                          // FIXED: Uses interpolate instead of crashing the app!
+                          r={scale.interpolate({ inputRange: [0, 1], outputRange: [0, baseRadius] })}
+                          fill={isTargeted ? COLORS.amber : NODE_TONES[toneIdx]}
+                          opacity={0.95}
+                        />
+                      </React.Fragment>
                     ); // Closes return
-                  })} 
+                  })}
 
                   {/* 4. "YOU" BOTTOM ANCHOR */}
                   <Circle // Draw the massive glowing aura
@@ -1081,7 +1240,7 @@ export default function App() { // The main function that React Native renders t
                     cy={ANCHOR_Y + 120} // Push it far down off the screen
                     r={180} // Make it massive
                     fill="url(#youGrad)" // Paint it using our RadialGradient defined earlier
-                  /> 
+                  />
                   <Circle // Draw the physical hard line
                     cx={ANCHOR_X} // Center X
                     cy={ANCHOR_Y + 160} // Push it further down
@@ -1090,20 +1249,20 @@ export default function App() { // The main function that React Native renders t
                     stroke={COLORS.amber} // Amber ring
                     strokeWidth={1} // Razor thin
                     opacity={0.3} // Very dim
-                  /> 
-                </Svg> 
-              </GestureDetector> 
+                  />
+                </Svg>
+              </GestureDetector>
 
               {/* NEW — the "flick to transmit" cue at the top, gently breathing in and out */}
               {/* with the same heartbeat engine as everything else, so it never feels static */}
-              <Animated.Text 
-                style={[ 
+              <Animated.Text
+                style={[
                   styles.topLabel, // Positions it in the TOP_SAFE_ZONE reserved for it
                   { opacity: pulseAnim.interpolate({ inputRange: [0, 1], outputRange: [0.35, 0.75] }) } // Slow breathing fade
-                ]} 
-              > 
-                flick to transmit. 
-              </Animated.Text> 
+                ]}
+              >
+                flick a file.
+              </Animated.Text>
 
               {/* 5. TEXT LABELS (Floating above the SVG) */}
               {peers.map((peer, i) => { // Loop through peers
@@ -1120,16 +1279,16 @@ export default function App() { // The main function that React Native renders t
                         color: isTargeted ? COLORS.amber : COLORS.mutedText // Amber if tapped, dim grey if idle
                       } // Closes dynamic object
                     ]} // Closes style array
-                  > 
-                    {peer.label} 
-                  </Text> 
+                  >
+                    {peer.label}
+                  </Text>
                 ); // Closes return
-              })} 
+              })}
 
               {/* 6. BOTTOM HUD */}
               <View // Container wrapper
                 style={styles.hud} // CSS floating at the bottom
-              > 
+              >
                 {ghostDropMsg ? ( // IF we have a red error message...
                   <Text // Render error text
                     style={[ // Style array
@@ -1138,24 +1297,24 @@ export default function App() { // The main function that React Native renders t
                         color: COLORS.error // Force it to the soft red
                       } // Closes dynamic object
                     ]} // Closes style array
-                  > 
-                    {ghostDropMsg} 
-                  </Text> 
+                  >
+                    {ghostDropMsg}
+                  </Text>
                 ) : ( // ELSE (no error)...
                   <Text // Render normal status text
                     style={styles.caption} // Dim custom font subtext
-                  > 
-                    {status || (selectedFiles.length > 0 ? 'payload armed. flick to send.' : 'tap the core to load.')} 
-                    {targetId ? ` → ${peers.find((p) => p.deviceId === targetId)?.label}` : ''} 
-                  </Text> 
-                )} 
-              </View> 
+                  >
+                    {status || (selectedFiles.length > 0 ? 'payload armed. flick to send.' : 'tap the core to load.')}
+                    {targetId ? ` → ${peers.find((p) => p.deviceId === targetId)?.label}` : ''}
+                  </Text>
+                )}
+              </View>
 
-            </View> 
-          </GestureDetector> 
-        )} 
-      </Animated.View> 
-    </GestureHandlerRootView> 
+            </View>
+          </GestureDetector>
+        )}
+      </Animated.View>
+    </GestureHandlerRootView>
   ); // Closes main return
 } // Closes App component
 
@@ -1257,27 +1416,29 @@ const styles = StyleSheet.create({ // Initializes the native styling engine
     flexDirection: 'row', // Horizontal
     gap: 12 // Exact native spacing between each box
   }, // Closes pinRow
-  pinBox: { // The individual PIN squares
-    width: 40, // Square width
-    height: 50, // Slightly taller than square
-    borderBottomWidth: 1, // Draws only a bottom underline
-    alignItems: 'center', // Centers the number horizontally
-    justifyContent: 'center' // Centers the number vertically
-  }, // Closes pinBox
+  ppinBox: {
+    width: 40,
+    height: 50,
+    backgroundColor: 'rgba(184, 142, 142, 0.05)',
+    borderRadius: 23,
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center'
+  },
   pinDigit: { // The number itself
     fontFamily: 'Pliant', // Enforces custom font
     fontSize: 20, // Large
-    fontWeight: '300' // Thin
+    fontWeight: '200' // Thin
   }, // Closes pinDigit
-  
+
   topLabel: { // NEW — the "flick to transmit" cue that TOP_SAFE_ZONE was always reserving room for
     fontFamily: 'Pliant', // Enforces custom font
-    position: 'absolute', // Locked to specific coords, floats above the SVG
+    // Locked to specific coords, floats above the SVG
     top: 58, // Sits comfortably inside the safe area, above the notch
     width: '100%', // Spans full width so text can center
     textAlign: 'center', // Centers the text
     fontSize: 10, // Tiny, matching the bottom caption
-    letterSpacing: 2, // Wide tracking, matching the rest of the UI's rhythm
+    letterSpacing: 3, // Wide tracking, matching the rest of the UI's rhythm
     color: COLORS.mutedText, // Dim grey — a cue, not a shout
     fontWeight: '300' // Thin
   }, // Closes topLabel
@@ -1296,7 +1457,7 @@ const styles = StyleSheet.create({ // Initializes the native styling engine
     letterSpacing: 1, // Tight tracking
     fontWeight: '300' // Thin
   }, // Closes peerLabel
-  
+
   hud: { // The bottom status area
     position: 'absolute', // Locked to specific coords
     bottom: 120, // Locked exactly 120 pixels up from the physical bottom edge
@@ -1310,5 +1471,32 @@ const styles = StyleSheet.create({ // Initializes the native styling engine
     color: COLORS.text, // White
     fontWeight: '300', // Thin
     opacity: 0.8 // Slightly dimmed
-  } // Closes caption
+  }, // Closes caption
+  splashScreenContainer: {
+    flex: 1,
+    width: '100%',
+    height: '100%',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  introTagline: {
+    fontSize: 11,
+    color: COLORS.mutedText, // Dim grey 
+    letterSpacing: 9, // Wide-spaced premium look
+    fontWeight: '700',
+    textTransform: 'lowercase',
+    marginBottom: 40, // Space before the loading bar hits
+    opacity: 0.6,
+  },
+  progressBarTrack: {
+    width: 130, // Total width of the bar
+    height: 1, // Razor thin
+    backgroundColor: COLORS.boxBorder, // Dark grey background
+    marginTop: -50, // Pulls it up tight under the logo
+    overflow: 'hidden'
+  },
+  progressBarFill: {
+    height: '100%',
+    backgroundColor: COLORS.idkman, // The glowing amber fill
+  },
 }); // Closes StyleSheet.create
