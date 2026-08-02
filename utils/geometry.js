@@ -85,3 +85,71 @@ export const DUST_STARS = Array.from({ length: 52 }, (_, i) => ({
 // 6 fixed angles the grey shards fly outward along on a failed transfer.
 // fixed, not random, so the shatter always looks the same clean shape.
 export const SHARD_ANGLES = [0, 60, 120, 180, 240, 300].map((deg) => (deg * Math.PI) / 180);
+
+// export the function so it can be pulled into app.js
+export function generateLightningPath(x1, y1, x2, y2, deviceId) {
+  // how many jagged "breaks" the lightning has (increase for more zig-zags)
+  const segments = 5; 
+  // calculate the total horizontal distance between phone and laptop
+  const dx = x2 - x1;
+  // calculate the total vertical distance between phone and laptop
+  const dy = y2 - y1;
+  // find the direct straight-line length (fallback to 1 to avoid dividing by zero)
+  const len = Math.hypot(dx, dy) || 1;
+  // calculate the perpendicular x vector for the jagged offset
+  const nx = -dy / len; 
+  // calculate the perpendicular y vector for the jagged offset
+  const ny = dx / len;  
+
+  // collect every joint (including start/end) so we can both build the path
+  // string AND measure its real jagged length, not just the straight-line one —
+  // needed so an animated "draw-on" strike can be timed to its actual length
+  const points = [{ x: x1, y: y1 }];
+  // set a default midpoint x just in case
+  let midX = (x1 + x2) / 2;
+  // set a default midpoint y just in case
+  let midY = (y1 + y2) / 2;
+
+  // loop through each segment to draw the jagged breaks
+  for (let i = 1; i < segments; i++) {
+    // calculate how far along the straight line we are (0.0 to 1.0)
+    const t = i / segments;
+    // find the exact base x coordinate on the straight line for this segment
+    const baseX = x1 + dx * t;
+    // find the exact base y coordinate on the straight line for this segment
+    const baseY = y1 + dy * t;
+    
+    // create a unique string based on the laptop's id and the segment number
+    const seedStr = deviceId + 'zap' + i;
+    // use your stable hash to generate a permanent offset (change 90 to make it wider/crazier)
+    const offset = (hashToUnit(seedStr) - 0.5) * 90; 
+    
+    // apply the perpendicular x offset to the straight line point
+    const px = baseX + nx * offset;
+    // apply the perpendicular y offset to the straight line point
+    const py = baseY + ny * offset;
+    
+    points.push({ x: px, y: py });
+
+    // if we are on the second segment break...
+    if (i === 2) { 
+      // save this specific x coordinate to draw a spark here later
+      midX = px;
+      // save this specific y coordinate to draw a spark here later
+      midY = py;
+    }
+  }
+  // finally, connect the last jagged point directly to the laptop node
+  points.push({ x: x2, y: y2 });
+
+  // build the svg path string and measure the jagged length in the same pass
+  let d = `M ${points[0].x} ${points[0].y}`;
+  let length = 0;
+  for (let i = 1; i < points.length; i++) {
+    d += ` L ${points[i].x} ${points[i].y}`;
+    length += Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y);
+  }
+
+  // return the completed path string, spark coordinates, and its real length
+  return { d, midX, midY, length };
+}
