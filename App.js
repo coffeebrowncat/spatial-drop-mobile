@@ -20,7 +20,10 @@ import Svg, {
   Circle,
   Defs,
   RadialGradient,
-  Stop
+  Stop,
+  Path,
+  Line,
+  Ellipse
 } from 'react-native-svg';
 
 import * as DocumentPicker from 'expo-document-picker';
@@ -37,13 +40,16 @@ import {
   ANCHOR_X,
   ANCHOR_Y
 } from './constants/layout';
-import { hashToUnit, toneIndexForDevice, radiusForDevice } from './utils/hash';
+import { hashToUnit } from './utils/hash';
 import { scatterPositionFor, branchPathFor, DUST_STARS, SHARD_ANGLES } from './utils/geometry';
 import { generateId } from './utils/id';
 import { resolveIp } from './utils/network';
-import { AnimatedCircle, AnimatedPath } from './components/AnimatedPrimitives';
+import { AnimatedCircle, AnimatedPath, AnimatedLine } from './components/AnimatedPrimitives';
 import { MatrixBackground } from './components/MatrixBackground';
 import { styles } from './styles/appStyles';
+import { SquigglyOrb } from './components/SquigglyOrb';
+import { DispatchManifest } from './components/DispatchManifest';
+import { PeerConstellation } from './components/PeerConstellation';
 
 export default function App() { // main function react native renders to the screen
 
@@ -61,6 +67,8 @@ export default function App() { // main function react native renders to the scr
   const [selectedFiles, setSelectedFiles] = useState([]); // files picked from the gallery
   const [targetId, setTargetId] = useState(null); // which specific orb the user tapped on
   const [shattered, setShattered] = useState(false); // true briefly when a throw fails mid-flight
+  const [dispatchSnapshot, setDispatchSnapshot] = useState([]); // files frozen at swipe-time, purely for the vanish animation
+  const [strikeTargets, setStrikeTargets] = useState([]); // deviceIds the lightning strike is currently animating toward
 
   // --- physics/animation variables (changing these does not refresh the ui) ---
   const canvasOpacity = useRef(new Animated.Value(1)).current; // screen fade, starts fully visible
@@ -448,6 +456,12 @@ export default function App() { // main function react native renders to the scr
       return; // nothing loaded
     }
 
+    const dispatched = selectedFiles; // freeze what's being sent before the tray empties
+    setDispatchSnapshot(dispatched); // hands these off to the vanish animation
+    setStrikeTargets(targetId ? [targetId] : peers.map((p) => p.deviceId)); // one bolt if targeted, one to everyone if broadcasting
+    setSelectedFiles([]); // empty the tray the instant the flick registers, not after upload finishes
+    setTargetId(null); // un-target the orb
+
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy); // massive physical thud
     setGhostDropMsg(null); // clear old error text
     setStatus('dropping...');
@@ -457,10 +471,13 @@ export default function App() { // main function react native renders to the scr
       toValue: 1,
       duration: 500, // half a second to travel up the screen
       useNativeDriver: false // must be false for svg sizing
-    }).start();
+    }).start(() => {
+      setDispatchSnapshot([]); // tags have fully dissolved, stop rendering them
+      setStrikeTargets([]); // strike has landed, stop rendering it
+    });
 
     const formData = new FormData(); // standard web payload container
-    selectedFiles.forEach((f) => {
+    dispatched.forEach((f) => {
       formData.append('files', {
         uri: f.uri,
         name: f.name,
@@ -506,9 +523,6 @@ export default function App() { // main function react native renders to the scr
         setShattered(false); // reset for the next attempt
       });
     }
-
-    setSelectedFiles([]); // clear memory
-    setTargetId(null); // un-target the orb
   };
 
   // --- gesture detectors ---
@@ -698,241 +712,105 @@ export default function App() { // main function react native renders to the scr
           </Animated.View>
         )}
 
-        {/* --- stage 4: the radar constellation --- */}
+        {/* --- STAGE 4: THE PLASMA FIELD (LIGHTNING) --- */}
         {stage === 'radar' && (
-          <GestureDetector gesture={swipeGesture}> {/* outer wrapper, listens for the swipe */}
-            <View style={styles.radarContainer}> {/* master container, fills the screen */}
-              <GestureDetector gesture={tapGesture}> {/* inner wrapper, listens for the tap */}
-                <Svg
-                  width={windowWidth} // exactly as wide as the phone
-                  height={windowHeight} // exactly as tall as the phone
-                  style={StyleSheet.absoluteFill} // pinned to the corners
-                >
+          <GestureDetector gesture={swipeGesture}>
+            <View style={styles.radarContainer}>
+              <GestureDetector gesture={tapGesture}>
+                <Svg width={windowWidth} height={windowHeight} style={StyleSheet.absoluteFill}>
                   <Defs>
-                    <RadialGradient id="youGrad" cx="50%" cy="50%" r="50%"> {/* soft glowing light effect */}
-                      <Stop offset="0%" stopColor={COLORS.amber} stopOpacity="0.4" /> {/* center core */}
-                      <Stop offset="100%" stopColor={COLORS.amber} stopOpacity="0" /> {/* outer edge, fades out */}
-                    </RadialGradient>
-
-                    {/* two dispersal-bloom gradients: warm amber for a successful drop, */}
-                    {/* grey for a failed one, replaces the old hard ring */}
-                    <RadialGradient id="boomGradAmber" cx="50%" cy="50%" r="50%">
-                      <Stop offset="0%" stopColor={COLORS.amber} stopOpacity="0.55" />
-                      <Stop offset="55%" stopColor={COLORS.amber} stopOpacity="0.2" />
-                      <Stop offset="100%" stopColor={COLORS.amber} stopOpacity="0" />
-                    </RadialGradient>
-                    <RadialGradient id="boomGradGrey" cx="50%" cy="50%" r="50%">
-                      <Stop offset="0%" stopColor={COLORS.mutedText} stopOpacity="0.5" />
-                      <Stop offset="55%" stopColor={COLORS.mutedText} stopOpacity="0.18" />
-                      <Stop offset="100%" stopColor={COLORS.mutedText} stopOpacity="0" />
-                    </RadialGradient>
-
-                    {/* one soft glow gradient per node tone, so each peer's orb */}
-                    {/* sits inside its own halo instead of a flat filled dot */}
                     {NODE_TONES.map((tone, i) => (
                       <RadialGradient key={`glow-${i}`} id={`nodeGlow${i}`} cx="50%" cy="50%" r="50%">
-                        <Stop offset="0%" stopColor={tone} stopOpacity="0.55" />
+                        <Stop offset="0%" stopColor={tone} stopOpacity="0.6" /> 
                         <Stop offset="100%" stopColor={tone} stopOpacity="0" />
                       </RadialGradient>
                     ))}
+                    <RadialGradient id="youGrad" cx="50%" cy="50%" r="50%">
+                      <Stop offset="0%" stopColor={COLORS.amber} stopOpacity="0.3" /> 
+                      <Stop offset="100%" stopColor={COLORS.amber} stopOpacity="0" /> 
+                    </RadialGradient>
                   </Defs>
 
-                  {/* 0. background dust — faint fixed stars, sitting behind everything else */}
+                  {/* 1. FAINT BACKGROUND DUST */}
                   {DUST_STARS.map((star, i) => (
-                    <Circle key={`dust-${i}`} cx={star.x} cy={star.y} r={star.r} fill={COLORS.text} opacity={star.o} />
-                  ))}
-
-                  {/* 1. constellation branches — curved, bowed connections instead of dead-straight */}
-                  {/* spokes, so the whole graph reads as an organic constellation */}
-                  {peers.map((peer, i) => {
-                    const pos = scatterPositionFor(peer.deviceId, i); // this peer's coordinate
-                    const isTargeted = targetId === peer.deviceId; // is this line selected
-                    const branch = branchPathFor(ANCHOR_X, ANCHOR_Y, pos.x, pos.y, peer.deviceId); // curved path + bowed midpoint
-                    const toneIdx = toneIndexForDevice(peer.deviceId); // which warm tone this junction star uses
-                    return (
-                      <React.Fragment key={`branch-${peer.deviceId}`}>
-                        <AnimatedPath // the curved branch
-                          d={branch.d} // bowed quadratic-bezier path
-                          stroke={isTargeted ? COLORS.amber : COLORS.branch} // amber if active, dusty rose if idle
-                          strokeWidth={isTargeted ? 1.5 : 0.75} // thick if active, thin if idle
-                          fill="none"
-                          opacity={ // complex heartbeat check
-                            isTargeted
-                              ? pulseAnim.interpolate({ // tied to the breathing engine
-                                inputRange: [0, 1],
-                                outputRange: [0.3, 0.85]
-                              })
-                              : 0.22 // idle, static — visible enough to read as a graph
-                          }
-                        />
-                        <Circle // tiny junction star where the branch bows
-                          cx={branch.midX}
-                          cy={branch.midY}
-                          r={isTargeted ? 2.5 : 1.6} // slightly bigger if active
-                          fill={NODE_TONES[toneIdx]} // matches the peer's own warm tone
-                          opacity={isTargeted ? 0.9 : 0.4}
-                        />
-                      </React.Fragment>
-                    );
-                  })}
-
-                  {/* 2. the dispersal — a soft bloom of light that expands and dissolves in place, */}
-                  {/* like a hue spreading outward, instead of a hard ring launching offscreen */}
-                  <AnimatedCircle // wide, soft outer bloom
-                    cx={ANCHOR_X} // centered horizontally
-                    cy={ // drifts gently upward as it disperses, doesn't fly off-screen
-                      boomAnim.interpolate({
-                        inputRange: [0, 1],
-                        outputRange: [ANCHOR_Y - 30, ANCHOR_Y - 170] // near the anchor -> drifts up and dissolves
-                      })
-                    }
-                    r={ // grows into a broad, soft glow rather than a screen-filling ring
-                      boomAnim.interpolate({
-                        inputRange: [0, 1],
-                        outputRange: [24, 240]
-                      })
-                    }
-                    fill={shattered ? 'url(#boomGradGrey)' : 'url(#boomGradAmber)'} // grey if the drop failed
-                    opacity={
-                      boomAnim.interpolate({
-                        inputRange: [0, 0.5, 1], // start -> halfway -> finished
-                        outputRange: [0.9, 0.6, 0] // solid -> dimming -> invisible
-                      })
-                    }
-                  />
-                  <AnimatedCircle // tighter, brighter core so it still reads as "a spark just left"
-                    cx={ANCHOR_X}
-                    cy={ // same drift as the outer bloom
-                      boomAnim.interpolate({
-                        inputRange: [0, 1],
-                        outputRange: [ANCHOR_Y - 30, ANCHOR_Y - 170]
-                      })
-                    }
-                    r={ // shrinks to nothing as the bloom takes over
-                      boomAnim.interpolate({
-                        inputRange: [0, 1],
-                        outputRange: [10, 0] // bright pinpoint -> dissolves away
-                      })
-                    }
-                    fill={shattered ? COLORS.mutedText : COLORS.amber} // solid core, grey if failed
-                    opacity={
-                      boomAnim.interpolate({
-                        inputRange: [0, 0.6, 1],
-                        outputRange: [1, 0.4, 0] // solid -> dimming -> gone
-                      })
-                    }
-                  />
-
-                  {/* 2b. the shatter: grey particles bursting outward, only exists briefly */}
-                  {/* right after a failed throw */}
-                  {shattered && SHARD_ANGLES.map((angle, i) => (
-                    <AnimatedCircle // one grey shard
-                      key={`shard-${i}`}
-                      cx={shatterAnim.interpolate({
-                        inputRange: [0, 1],
-                        outputRange: [ANCHOR_X, ANCHOR_X + Math.cos(angle) * 90] // anchor -> fly outward at this angle
-                      })}
-                      cy={shatterAnim.interpolate({
-                        inputRange: [0, 1],
-                        outputRange: [ANCHOR_Y - 60, ANCHOR_Y - 60 + Math.sin(angle) * 90]
-                      })}
-                      r={shatterAnim.interpolate({ // shrinks as it flies, like debris burning out
-                        inputRange: [0, 1],
-                        outputRange: [5, 0]
-                      })}
-                      fill={COLORS.mutedText} // dull grey, matches the retinted boom
-                      opacity={shatterAnim.interpolate({ // fades out as it travels
-                        inputRange: [0, 0.6, 1],
-                        outputRange: [0.9, 0.6, 0]
-                      })}
+                    <Circle 
+                      key={`dust-${i}`} 
+                      cx={star.x} // horizontal hash placement
+                      cy={star.y} // vertical hash placement
+                      r={star.r} // base size of the dust
+                      fill={COLORS.text} // pure white
+                      opacity={star.o} // dim hashed opacity
                     />
                   ))}
 
-                  {/* 3. peer orbs — each one its own glowing, breathing constellation star */}
-                  {peers.map((peer, i) => {
-                    const pos = scatterPositionFor(peer.deviceId, i); // this peer's coordinate
-                    const scale = getPeerScale(peer.deviceId); // join-bounce spring animation
-                    const breathe = getPeerBreathe(peer.deviceId); // idle breathing animation
-                    const isTargeted = targetId === peer.deviceId;
-                    const toneIdx = toneIndexForDevice(peer.deviceId); // which warm tone family this orb belongs to
-                    const baseRadius = radiusForDevice(peer.deviceId); // this orb's own base size
-                    const breatheOpacity = breathe.interpolate({ inputRange: [0, 1], outputRange: [0.65, 1] }); // slow living pulse
+                  {/* 2 & 3. PEER CONSTELLATION — orbiting nodes, ambient bolts, and the swipe-triggered strike */}
+                  <PeerConstellation
+                    peers={peers}
+                    getSlotFor={getSlotFor}
+                    getPeerScale={getPeerScale}
+                    getPeerBreathe={getPeerBreathe}
+                    targetId={targetId}
+                    pulseAnim={pulseAnim}
+                    boomAnim={boomAnim}
+                    strikeTargets={strikeTargets}
+                  />
 
+                  {/* 4. THE 3D SQUIGGLY ORB (Anchor) */}
+                  <SquigglyOrb 
+                    cx={ANCHOR_X} 
+                    cy={ANCHOR_Y + 120} 
+                    radius={180} 
+                    color={COLORS.idkman} 
+                    pulseAnim={pulseAnim} 
+                  />
+
+                  {/* 5. THE DISPATCH BLOOM — soft light lifting off the anchor as files launch */}
+                  {(dispatchSnapshot.length > 0 || shattered) && (
+                    <AnimatedCircle
+                      cx={ANCHOR_X}
+                      cy={ANCHOR_Y}
+                      r={boomAnim.interpolate({ inputRange: [0, 1], outputRange: [10, 220] })}
+                      fill={shattered ? COLORS.mutedText : COLORS.amber}
+                      opacity={boomAnim.interpolate({ inputRange: [0, 0.6, 1], outputRange: [0.35, 0.12, 0] })}
+                    />
+                  )}
+
+                  {/* 6. FAILURE SHARDS — fire outward along the 6 fixed angles from where the boom died */}
+                  {shattered && SHARD_ANGLES.map((angle, i) => {
+                    const dx = Math.cos(angle); // fixed per-shard direction, computed once at render
+                    const dy = Math.sin(angle);
                     return (
-                      <React.Fragment key={peer.deviceId}>
-                        {/* soft halo behind the core */}
-                        <AnimatedCircle
-                          cx={pos.x}
-                          cy={pos.y}
-                          r={scale.interpolate({ inputRange: [0, 1], outputRange: [0, baseRadius * 2.6] })}
-                          fill={`url(#nodeGlow${toneIdx})`}
-                          opacity={breatheOpacity}
-                        />
-                        {isTargeted && ( // currently tapped
-                          <AnimatedCircle
-                            cx={pos.x}
-                            cy={pos.y}
-                            r={baseRadius + 12}
-                            fill="none"
-                            stroke={COLORS.amber}
-                            strokeWidth={1}
-                            opacity={0.8}
-                          />
-                        )}
-                        <AnimatedCircle // the core orb
-                          cx={pos.x}
-                          cy={pos.y}
-                          r={scale.interpolate({ inputRange: [0, 1], outputRange: [0, baseRadius] })}
-                          fill={isTargeted ? COLORS.amber : NODE_TONES[toneIdx]}
-                          opacity={0.95}
-                        />
-                      </React.Fragment>
+                      <AnimatedCircle
+                        key={`shard-${i}`}
+                        cx={shatterAnim.interpolate({ inputRange: [0, 1], outputRange: [ANCHOR_X, ANCHOR_X + dx * 110] })}
+                        cy={shatterAnim.interpolate({ inputRange: [0, 1], outputRange: [ANCHOR_Y, ANCHOR_Y + dy * 110] })}
+                        r={shatterAnim.interpolate({ inputRange: [0, 1], outputRange: [4, 1] })}
+                        fill={COLORS.mutedText}
+                        opacity={shatterAnim.interpolate({ inputRange: [0, 0.7, 1], outputRange: [0.8, 0.5, 0] })}
+                      />
                     );
                   })}
-
-                  {/* 4. "you" bottom anchor */}
-                  <Circle // massive glowing aura
-                    cx={ANCHOR_X}
-                    cy={ANCHOR_Y + 120} // pushed far down off the screen
-                    r={180}
-                    fill="url(#youGrad)"
-                  />
-                  <Circle // physical hard line
-                    cx={ANCHOR_X}
-                    cy={ANCHOR_Y + 160} // pushed further down
-                    r={180}
-                    fill={COLORS.bg} // black core
-                    stroke={COLORS.amber} // amber ring
-                    strokeWidth={1} // razor thin
-                    opacity={0.3} // very dim
-                  />
                 </Svg>
               </GestureDetector>
 
-              {/* the "flick to transmit" cue at the top, breathing with the same */}
-              {/* heartbeat engine as everything else so it never feels static */}
-              <Animated.Text
-                style={[
-                  styles.topLabel, // positioned in the reserved top safe zone
-                  { opacity: pulseAnim.interpolate({ inputRange: [0, 1], outputRange: [0.35, 0.75] }) } // slow breathing fade
-                ]}
-              >
-                flick a file.
+              {/* 5. FLOATING UI LABELS */}
+              <Animated.Text style={[styles.topLabel, { opacity: pulseAnim.interpolate({ inputRange: [0, 1], outputRange: [0.3, 0.7] }) }]}>
+                {selectedFiles.length > 0 ? 'launch code.' : 'flick a file.'}
               </Animated.Text>
 
-              {/* 5. text labels (floating above the svg) */}
-              {peers.map((peer, i) => {
-                const pos = scatterPositionFor(peer.deviceId, i); // this peer's coordinate
+              {peers.map((peer) => {
+                const pos = scatterPositionFor(getSlotFor(peer.deviceId));
                 const isTargeted = targetId === peer.deviceId;
+                
                 return (
-                  <Text
-                    key={`label-${peer.deviceId}`}
+                  <Text 
+                    key={`label-${peer.deviceId}`} 
                     style={[
-                      styles.peerLabel,
-                      {
-                        left: pos.x - 40, // centers the 80px text box on the x coord
-                        top: pos.y + 15, // 15px below the orb
-                        color: isTargeted ? COLORS.amber : COLORS.mutedText
+                      styles.peerLabel, 
+                      { 
+                        left: pos.x - 40, // centers the 80px wide text box
+                        top: pos.y + 15, // drops text below the orb
+                        color: isTargeted ? COLORS.amber : COLORS.mutedText // highlights if targeted
                       }
                     ]}
                   >
@@ -941,21 +819,23 @@ export default function App() { // main function react native renders to the scr
                 );
               })}
 
-              {/* 6. bottom hud */}
+              {/* THE ARMED MANIFEST — files loaded and waiting, sitting still above the anchor */}
+              {selectedFiles.length > 0 && (
+                <DispatchManifest files={selectedFiles} boomAnim={boomAnim} dispatching={false} />
+              )}
+
+              {/* THE DISPATCHED MANIFEST — the same tags, now lifting off and dissolving */}
+              {dispatchSnapshot.length > 0 && (
+                <DispatchManifest files={dispatchSnapshot} boomAnim={boomAnim} dispatching={true} />
+              )}
+
+              {/* 6. BOTTOM HUD / ERRORS */}
               <View style={styles.hud}>
-                {ghostDropMsg ? ( // we have a red error message
-                  <Text
-                    style={[
-                      styles.caption,
-                      { color: COLORS.error }
-                    ]}
-                  >
-                    {ghostDropMsg}
-                  </Text>
-                ) : ( // no error
+                {ghostDropMsg ? (
+                  <Text style={[styles.caption, { color: COLORS.error }]}>{ghostDropMsg}</Text>
+                ) : (
                   <Text style={styles.caption}>
-                    {status || (selectedFiles.length > 0 ? 'payload armed. flick to send.' : 'tap the core to load.')}
-                    {targetId ? ` → ${peers.find((p) => p.deviceId === targetId)?.label}` : ''}
+                    {status || (selectedFiles.length > 0 ? `[ ${selectedFiles.length} FILE(S) ARMED ]` : '')}
                   </Text>
                 )}
               </View>
