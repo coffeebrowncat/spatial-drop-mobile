@@ -1,10 +1,12 @@
 import { hashToUnit } from './hash';
 import {
   windowWidth,
+  windowHeight,
   SCREEN_PADDING,
   TOP_SAFE_ZONE,
   BOTTOM_SAFE_ZONE
 } from '../constants/layout';
+import { CONSTELLATION_SHAPES } from '../constants/ConstellationShapes'; // NOTE: matches your actual filename (capital C). if you ever rename that file to lowercase, update this import to match — case mismatches here work fine on Windows/Mac but will 404 on Android/Linux builds
 
 // returns the nth point in a base-b halton low-discrepancy sequence (0–1).
 // used instead of hand-rolled trig/random so scattered points cover an
@@ -25,13 +27,34 @@ export function haltonSeq(index, base) {
 // permanent "slot" (1st ever seen this session = 1, 2nd = 2, ...) so the
 // halton sequence's even-spread guarantee actually applies to whoever is
 // currently connected, instead of scattering by device-id hash alone.
-export function scatterPositionFor(slot) {
-  const u = haltonSeq(slot, 2); // low-discrepancy x, 0–1
-  const v = haltonSeq(slot, 3); // low-discrepancy y, 0–1 (different base so x/y never correlate)
+// picks a constellation shape for the current peer count, seeded off the
+// room pin so everyone in the same session lands on the same shape.
+export function constellationShapeFor(peerCount, seed) {
+  const bigEnough = CONSTELLATION_SHAPES.filter((s) => s.nodes.length >= peerCount);
+  const pool = bigEnough.length > 0 ? bigEnough : CONSTELLATION_SHAPES;
+  const pick = Math.floor(hashToUnit(seed + 'constellationPick') * pool.length);
+  return pool[Math.min(pick, pool.length - 1)];
+}
 
+// generates the nth connected peer's screen position. once there's a room
+// pin and at least one peer, positions come from a named constellation
+// shape instead of the raw halton scatter. falls back to halton if called
+// without a seed (shouldn't happen in practice).
+export function scatterPositionFor(slot, peerCount = 0, seed = '') {
   const usableWidth = windowWidth - SCREEN_PADDING * 2;
   const usableHeight = BOTTOM_SAFE_ZONE - TOP_SAFE_ZONE;
 
+  if (peerCount > 0 && seed) {
+    const shape = constellationShapeFor(peerCount, seed);
+    const node = shape.nodes[(slot - 1) % shape.nodes.length];
+    return {
+      x: SCREEN_PADDING + node.x * usableWidth,
+      y: TOP_SAFE_ZONE + node.y * usableHeight
+    };
+  }
+
+  const u = haltonSeq(slot, 2);
+  const v = haltonSeq(slot, 3);
   return {
     x: SCREEN_PADDING + u * usableWidth,
     y: TOP_SAFE_ZONE + v * usableHeight
@@ -75,12 +98,45 @@ export function branchPathFor(x1, y1, x2, y2, deviceId) {
 
 // fixed field of tiny, dim background stars for atmosphere. generated once
 // at module load (not per-render) so it never jitters or re-shuffles.
+// kept around for anyone still importing it, but App.js now renders
+// GRID_DOTS instead — see the comment below for why.
 export const DUST_STARS = Array.from({ length: 52 }, (_, i) => ({
   x: SCREEN_PADDING + hashToUnit(`dust${i}x`) * (windowWidth - SCREEN_PADDING * 2),
   y: TOP_SAFE_ZONE + hashToUnit(`dust${i}y`) * (BOTTOM_SAFE_ZONE - TOP_SAFE_ZONE),
   r: 0.5 + hashToUnit(`dust${i}r`) * 1.1,
   o: 0.04 + hashToUnit(`dust${i}o`) * 0.14
 }));
+
+// structured background texture — a faint, evenly-spaced dot grid instead
+// of 52 random dust specks. the old random scatter left huge dead patches
+// of pure black between dots, which is a big part of why the screen read
+// as unfinished. a uniform grid — even a very faint one — reads as
+// "sensor field" instead of "empty void," and because it's a grid (not
+// random placement) it stays quiet and non-distracting no matter how much
+// of the screen it covers. runs the full height so it fills the space
+// behind the anchor too, not just the peer zone.
+const GRID_SPACING = 46; // px between dots, both axes
+export const GRID_DOTS = (() => {
+  const dots = [];
+  const usableWidth = windowWidth - SCREEN_PADDING * 2;
+  const usableHeight = windowHeight - TOP_SAFE_ZONE - 40;
+  const cols = Math.floor(usableWidth / GRID_SPACING);
+  const rows = Math.floor(usableHeight / GRID_SPACING);
+  for (let row = 0; row <= rows; row++) {
+    for (let col = 0; col <= cols; col++) {
+      const jitterX = (hashToUnit(`grid${row}_${col}x`) - 0.5) * 4; // tiny per-dot jitter so it doesn't read as a spreadsheet
+      const jitterY = (hashToUnit(`grid${row}_${col}y`) - 0.5) * 4;
+      const seed = hashToUnit(`grid${row}_${col}o`);
+      dots.push({
+        x: SCREEN_PADDING + col * GRID_SPACING + jitterX,
+        y: TOP_SAFE_ZONE + row * GRID_SPACING + jitterY,
+        r: 0.7,
+        o: 0.045 + seed * 0.05 // low, near-uniform opacity — bumped up slightly from the first pass, which was so faint it barely registered
+      });
+    }
+  }
+  return dots;
+})();
 
 // 6 fixed angles the grey shards fly outward along on a failed transfer.
 // fixed, not random, so the shatter always looks the same clean shape.
@@ -89,7 +145,7 @@ export const SHARD_ANGLES = [0, 60, 120, 180, 240, 300].map((deg) => (deg * Math
 // export the function so it can be pulled into app.js
 export function generateLightningPath(x1, y1, x2, y2, deviceId) {
   // how many jagged "breaks" the lightning has (increase for more zig-zags)
-  const segments = 5; 
+  const segments = 5;
   // calculate the total horizontal distance between phone and laptop
   const dx = x2 - x1;
   // calculate the total vertical distance between phone and laptop
@@ -97,9 +153,9 @@ export function generateLightningPath(x1, y1, x2, y2, deviceId) {
   // find the direct straight-line length (fallback to 1 to avoid dividing by zero)
   const len = Math.hypot(dx, dy) || 1;
   // calculate the perpendicular x vector for the jagged offset
-  const nx = -dy / len; 
+  const nx = -dy / len;
   // calculate the perpendicular y vector for the jagged offset
-  const ny = dx / len;  
+  const ny = dx / len;
 
   // collect every joint (including start/end) so we can both build the path
   // string AND measure its real jagged length, not just the straight-line one —
@@ -118,21 +174,21 @@ export function generateLightningPath(x1, y1, x2, y2, deviceId) {
     const baseX = x1 + dx * t;
     // find the exact base y coordinate on the straight line for this segment
     const baseY = y1 + dy * t;
-    
+
     // create a unique string based on the laptop's id and the segment number
     const seedStr = deviceId + 'zap' + i;
     // use your stable hash to generate a permanent offset (change 90 to make it wider/crazier)
-    const offset = (hashToUnit(seedStr) - 0.5) * 90; 
-    
+    const offset = (hashToUnit(seedStr) - 0.5) * 90;
+
     // apply the perpendicular x offset to the straight line point
     const px = baseX + nx * offset;
     // apply the perpendicular y offset to the straight line point
     const py = baseY + ny * offset;
-    
+
     points.push({ x: px, y: py });
 
     // if we are on the second segment break...
-    if (i === 2) { 
+    if (i === 2) {
       // save this specific x coordinate to draw a spark here later
       midX = px;
       // save this specific y coordinate to draw a spark here later
