@@ -11,7 +11,8 @@ export const COLORS = {
   lineIdle: 'rgba(255, 255, 255, 0.06)', // barely visible white under the rose branch tint
   lineActive: 'rgba(217, 154, 91, 0.5)', // amber at 50% opacity, pulsing active path
   branch: 'rgba(196, 111, 111, 0.28)', // dusty rose tint for idle constellation branches
-  idkman: 'rgba(189, 118, 12, 0.49)'
+  idkman: 'rgba(189, 118, 12, 0.49)',
+  incomingGlow: '#8C4A56', // darker wine — used when a peer is actively sending files to you
 };
 
 // warm family of node tones (amber-gold through dusty rose), picked per-device
