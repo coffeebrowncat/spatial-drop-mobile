@@ -94,7 +94,7 @@ export const styles = StyleSheet.create({
     flexDirection: 'row',
     gap: 12 // exact native spacing between each box
   },
-  ppinBox: {
+  pinBox: {
     width: 40,
     height: 50,
     backgroundColor: 'rgba(184, 142, 142, 0.05)',
