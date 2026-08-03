@@ -32,16 +32,18 @@ import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 import * as Haptics from 'expo-haptics';
 import * as Font from 'expo-font';
+import { BlurView } from 'expo-blur';
 
-import { COLORS, NODE_TONES } from './constants/colors';
+import { COLORS } from './constants/colors';
 import {
   windowWidth,
   windowHeight,
   ANCHOR_X,
-  ANCHOR_Y
+  ANCHOR_Y,
+  ANCHOR_RADIUS
 } from './constants/layout';
 import { hashToUnit } from './utils/hash';
-import { scatterPositionFor, branchPathFor, DUST_STARS, SHARD_ANGLES } from './utils/geometry';
+import { scatterPositionFor, branchPathFor, GRID_DOTS, SHARD_ANGLES } from './utils/geometry';
 import { generateId } from './utils/id';
 import { resolveIp } from './utils/network';
 import { AnimatedCircle, AnimatedPath, AnimatedLine } from './components/AnimatedPrimitives';
@@ -69,6 +71,7 @@ export default function App() { // main function react native renders to the scr
   const [shattered, setShattered] = useState(false); // true briefly when a throw fails mid-flight
   const [dispatchSnapshot, setDispatchSnapshot] = useState([]); // files frozen at swipe-time, purely for the vanish animation
   const [strikeTargets, setStrikeTargets] = useState([]); // deviceIds the lightning strike is currently animating toward
+  const [incomingFromId, setIncomingFromId] = useState(null); // deviceId currently sending files to us, or null
 
   // --- physics/animation variables (changing these does not refresh the ui) ---
   const canvasOpacity = useRef(new Animated.Value(1)).current; // screen fade, starts fully visible
@@ -293,6 +296,8 @@ export default function App() { // main function react native renders to the scr
       setStatus('');
     } catch (err) { // wifi dropped mid-download
       setStatus('transfer lost to the void. try again.');
+    } finally {
+      setIncomingFromId(null); // whatever happened, this peer is no longer actively sending to us
     }
   };
 
@@ -318,6 +323,11 @@ export default function App() { // main function react native renders to the scr
     }
 
     if (data.type === 'incoming_files') { // the laptop is throwing to us
+      // NOTE: assumes the payload has a `fromDeviceId` field identifying the
+      // sender. check your backend's incoming_files message — if it uses a
+      // different key (senderId, deviceId, etc.), swap it in right here.
+      setIncomingFromId(data.fromDeviceId ?? null);
+
       if (data.trusted) { // already accepted before
         acceptAndDownload(data.transferId); // bypass the popup, download instantly
         return;
@@ -335,6 +345,7 @@ export default function App() { // main function react native renders to the scr
                 type: 'decline_transfer',
                 transferId: data.transferId
               }));
+              setIncomingFromId(null);
             }
           },
           {
@@ -463,6 +474,9 @@ export default function App() { // main function react native renders to the scr
     setTargetId(null); // un-target the orb
 
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy); // massive physical thud
+    setTimeout(() => {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium); // second beat, timed to the strike's impact flash
+    }, 440);
     setGhostDropMsg(null); // clear old error text
     setStatus('dropping...');
 
@@ -531,9 +545,17 @@ export default function App() { // main function react native renders to the scr
       // intentionally left blank: we want a frictionless flick, not a heavy drag
     })
     .onEnd((e) => { // fires the exact millisecond the thumb lifts off the glass
-      const swipedUpFarEnough = e.translationY < -80; // dragged up at least 80 pixels
-      const swipedFastEnough = e.velocityY < -400; // dragged fast enough
-      if (swipedUpFarEnough && swipedFastEnough) { // both conditions met
+      const distance = -e.translationY; // positive when swiped up
+      const speed = -e.velocityY; // positive when swiped up
+      // old logic required BOTH >80px of travel AND >400 velocity — but a
+      // real quick flick covers very little distance precisely because
+      // it's fast, so genuine flicks were failing the distance check
+      // before ever getting evaluated on speed. now: a real fast flick
+      // (high speed) registers even with barely any travel, OR a slower
+      // more deliberate drag still works as long as it covers real
+      // distance with at least some speed behind it
+      const registersAsSwipe = (distance > 40 && speed > 250) || speed > 700;
+      if (registersAsSwipe) {
         sendFiles();
       }
     });
@@ -542,7 +564,7 @@ export default function App() { // main function react native renders to the scr
     // the anchor itself is the picker trigger, a big target on purpose:
     // the visible arc of the "you" circle plus a little slack below it
     const distFromAnchor = Math.hypot(e.x - ANCHOR_X, e.y - ANCHOR_Y);
-    if (distFromAnchor < 190) { // generous hit radius matching the visible arc
+    if (distFromAnchor < ANCHOR_RADIUS + 90) { // generous hit radius matching the now fully-visible core
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); // tiny physical click
       pickFiles(); // open the photos/files choice
       return; // don't also hit-test peers this tap
@@ -550,7 +572,7 @@ export default function App() { // main function react native renders to the scr
 
     let hit = null; // assume they missed everything
     peers.forEach((peer) => { // loop through all the orbs
-      const pos = scatterPositionFor(getSlotFor(peer.deviceId)); // where this orb is physically drawn
+      const pos = scatterPositionFor(getSlotFor(peer.deviceId), peers.length, pin); // where this orb is physically drawn
       const dist = Math.hypot(e.x - pos.x, e.y - pos.y); // how far the tap landed from the orb's center
       if (dist < 40) { // within the hit-box radius
         hit = peer.deviceId; // record a direct hit
@@ -719,49 +741,82 @@ export default function App() { // main function react native renders to the scr
               <GestureDetector gesture={tapGesture}>
                 <Svg width={windowWidth} height={windowHeight} style={StyleSheet.absoluteFill}>
                   <Defs>
-                    {NODE_TONES.map((tone, i) => (
-                      <RadialGradient key={`glow-${i}`} id={`nodeGlow${i}`} cx="50%" cy="50%" r="50%">
-                        <Stop offset="0%" stopColor={tone} stopOpacity="0.6" /> 
-                        <Stop offset="100%" stopColor={tone} stopOpacity="0" />
-                      </RadialGradient>
-                    ))}
+                    <RadialGradient id="nodeGlowIdle" cx="50%" cy="50%" r="50%">
+                      <Stop offset="0%" stopColor={COLORS.mutedText} stopOpacity="0.5" />
+                      <Stop offset="100%" stopColor={COLORS.mutedText} stopOpacity="0" />
+                    </RadialGradient>
+                    <RadialGradient id="nodeGlowOutgoing" cx="50%" cy="50%" r="50%">
+                      <Stop offset="0%" stopColor={COLORS.amber} stopOpacity="0.6" />
+                      <Stop offset="100%" stopColor={COLORS.amber} stopOpacity="0" />
+                    </RadialGradient>
+                    <RadialGradient id="nodeGlowIncoming" cx="50%" cy="50%" r="50%">
+                      <Stop offset="0%" stopColor={COLORS.incomingGlow} stopOpacity="0.6" />
+                      <Stop offset="100%" stopColor={COLORS.incomingGlow} stopOpacity="0" />
+                    </RadialGradient>
                     <RadialGradient id="youGrad" cx="50%" cy="50%" r="50%">
-                      <Stop offset="0%" stopColor={COLORS.amber} stopOpacity="0.3" /> 
-                      <Stop offset="100%" stopColor={COLORS.amber} stopOpacity="0" /> 
+                      <Stop offset="0%" stopColor={COLORS.amber} stopOpacity="0.3" />
+                      <Stop offset="100%" stopColor={COLORS.amber} stopOpacity="0" />
                     </RadialGradient>
                   </Defs>
 
-                  {/* 1. FAINT BACKGROUND DUST */}
-                  {DUST_STARS.map((star, i) => (
-                    <Circle 
-                      key={`dust-${i}`} 
-                      cx={star.x} // horizontal hash placement
-                      cy={star.y} // vertical hash placement
-                      r={star.r} // base size of the dust
-                      fill={COLORS.text} // pure white
-                      opacity={star.o} // dim hashed opacity
+                  {/* 1. STRUCTURED SENSOR-FIELD DOTS — replaces the old 52 random dust
+                      specks, which left huge dead-black patches and was a big part of
+                      why the screen read as empty/unfinished. a faint, even grid reads
+                      as texture instead of void, and runs the full height so it fills
+                      the space behind the anchor too */}
+                  {GRID_DOTS.map((dot, i) => (
+                    <Circle
+                      key={`grid-${i}`}
+                      cx={dot.x}
+                      cy={dot.y}
+                      r={dot.r}
+                      fill={COLORS.text}
+                      opacity={dot.o}
                     />
                   ))}
 
-                  {/* 2 & 3. PEER CONSTELLATION — orbiting nodes, ambient bolts, and the swipe-triggered strike */}
+                  {/* 1.5 CORNER FRAME — hairline brackets so the canvas reads as a
+                      contained instrument display instead of just fading into black
+                      at the edges. purely decorative, costs nothing */}
+                  {[
+                    { x: 20, y: 54, dx: 1, dy: 1 }, // top-left
+                    { x: windowWidth - 20, y: 54, dx: -1, dy: 1 }, // top-right
+                    { x: 20, y: windowHeight - 36, dx: 1, dy: -1 }, // bottom-left
+                    { x: windowWidth - 20, y: windowHeight - 36, dx: -1, dy: -1 } // bottom-right
+                  ].map((c, i) => (
+                    <Path
+                      key={`corner-${i}`}
+                      d={`M ${c.x} ${c.y + 22 * c.dy} L ${c.x} ${c.y} L ${c.x + 22 * c.dx} ${c.y}`}
+                      stroke={COLORS.boxBorder}
+                      strokeWidth={1}
+                      fill="none"
+                      opacity={0.6}
+                    />
+                  ))}
+
+                  {/* 2 & 3. PEER CONSTELLATION — orbiting nodes, and the swipe-triggered strike */}
                   <PeerConstellation
                     peers={peers}
                     getSlotFor={getSlotFor}
                     getPeerScale={getPeerScale}
                     getPeerBreathe={getPeerBreathe}
                     targetId={targetId}
+                    incomingFromId={incomingFromId}
                     pulseAnim={pulseAnim}
                     boomAnim={boomAnim}
                     strikeTargets={strikeTargets}
+                    pin={pin}
                   />
 
-                  {/* 4. THE 3D SQUIGGLY ORB (Anchor) */}
-                  <SquigglyOrb 
-                    cx={ANCHOR_X} 
-                    cy={ANCHOR_Y + 120} 
-                    radius={180} 
-                    color={COLORS.idkman} 
-                    pulseAnim={pulseAnim} 
+                  {/* 4. THE ANCHOR INSTRUMENT CORE — fully on-screen now (see
+                      constants/layout.js), so its rings/gauge detail actually shows
+                      instead of being cropped by the bottom edge */}
+                  <SquigglyOrb
+                    cx={ANCHOR_X}
+                    cy={ANCHOR_Y}
+                    radius={ANCHOR_RADIUS}
+                    color={COLORS.idkman}
+                    pulseAnim={pulseAnim}
                   />
 
                   {/* 5. THE DISPATCH BLOOM — soft light lifting off the anchor as files launch */}
@@ -799,15 +854,15 @@ export default function App() { // main function react native renders to the scr
               </Animated.Text>
 
               {peers.map((peer) => {
-                const pos = scatterPositionFor(getSlotFor(peer.deviceId));
+                const pos = scatterPositionFor(getSlotFor(peer.deviceId), peers.length, pin);
                 const isTargeted = targetId === peer.deviceId;
-                
+
                 return (
-                  <Text 
-                    key={`label-${peer.deviceId}`} 
+                  <Text
+                    key={`label-${peer.deviceId}`}
                     style={[
-                      styles.peerLabel, 
-                      { 
+                      styles.peerLabel,
+                      {
                         left: pos.x - 40, // centers the 80px wide text box
                         top: pos.y + 15, // drops text below the orb
                         color: isTargeted ? COLORS.amber : COLORS.mutedText // highlights if targeted
@@ -829,14 +884,18 @@ export default function App() { // main function react native renders to the scr
                 <DispatchManifest files={dispatchSnapshot} boomAnim={boomAnim} dispatching={true} />
               )}
 
-              {/* 6. BOTTOM HUD / ERRORS */}
+              {/* 6. BOTTOM HUD / ERRORS — frosted glass pill instead of bare floating text */}
               <View style={styles.hud}>
-                {ghostDropMsg ? (
-                  <Text style={[styles.caption, { color: COLORS.error }]}>{ghostDropMsg}</Text>
-                ) : (
-                  <Text style={styles.caption}>
-                    {status || (selectedFiles.length > 0 ? `[ ${selectedFiles.length} FILE(S) ARMED ]` : '')}
-                  </Text>
+                {(ghostDropMsg || status || selectedFiles.length > 0) && (
+                  <BlurView intensity={35} tint="dark" style={styles.hudPill}>
+                    {ghostDropMsg ? (
+                      <Text style={[styles.caption, { color: COLORS.error }]}>{ghostDropMsg}</Text>
+                    ) : (
+                      <Text style={styles.caption}>
+                        {status || (selectedFiles.length > 0 ? `[ ${selectedFiles.length} FILE(S) ARMED ]` : '')}
+                      </Text>
+                    )}
+                  </BlurView>
                 )}
               </View>
 
