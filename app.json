@@ -5,6 +5,14 @@
     "sdkVersion": "54.0.0",
     "plugins": [
       "expo-font"
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "bc34961f-7755-4be3-9255-b159605e2592"
+      }
+    },
+    "android": {
+      "package": "com.merub.spatialdropmobile"
+    }
   }
 }
