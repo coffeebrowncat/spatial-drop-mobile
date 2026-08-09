@@ -34,7 +34,11 @@ import * as Haptics from 'expo-haptics';
 import * as Font from 'expo-font';
 import { BlurView } from 'expo-blur';
 
-import { COLORS } from './constants/colors';
+// NOTE: COLORS import removed — App.js now reads everything through
+// theme (see useTheme() below) so the light/dark toggle actually reaches
+// every screen, not just Settings. constants/colors.js still exists and
+// still works for any file that imports it directly (server-side stuff,
+// desktop.html, superhub.html, etc. aren't part of this context).
 import {
   windowWidth,
   windowHeight,
@@ -52,14 +56,50 @@ import { styles } from './styles/appStyles';
 import { SquigglyOrb } from './components/SquigglyOrb';
 import { DispatchManifest } from './components/DispatchManifest';
 import { PeerConstellation } from './components/PeerConstellation';
+import { ThemeProvider, useTheme } from './contexts/ThemeContext';
+import { AuthScreen } from './components/AuthScreen';
+import { SettingsMenu } from './components/SettingsMenu';
 
-export default function App() { // main function react native renders to the screen
+// the RENDER-hosted backend, not the local laptop one — account/profile
+// stuff needs to work no matter what wifi network the phone is on, so
+// this talks to the always-on deployed server, completely separate from
+// hostIpRef (which is only ever used for the local file-transfer calls)
+const RENDER_API_URL = 'https://spatial-drop.onrender.com';
+
+// fire-and-forget save of the signed-in user's profile to mongo. called
+// right after sign-in succeeds, and again any time the avatar changes.
+// wrapped in its own try/catch so a flaky connection here can never
+// block someone from actually using the app
+async function syncUserToBackend({ firebaseUid, email, displayName, isGuest, avatarId, theme }) {
+  try {
+    await fetch(`${RENDER_API_URL}/api/user/sync`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ firebaseUid, email, displayName, isGuest, avatarId, theme }),
+    });
+  } catch (err) {
+    console.log('user sync failed, not fatal:', err.message);
+  }
+}
+
+// this used to BE the default export, with <ThemeProvider> wrapped around
+// its own returned JSX. that's actually why light mode only ever affected
+// SettingsMenu — a component can't read a context it's the one rendering,
+// so useTheme() called in here would've just gotten the default value
+// forever, no matter what the toggle in Settings did. now this is a real
+// child of ThemeProvider (see the actual default export at the bottom),
+// so `theme` below is live and actually responds to the toggle.
+function AppInner() { // main function react native renders to the screen
+
+  const { theme } = useTheme(); // now genuinely reactive — see comment above
 
   // --- custom font state ---
   const [fontLoaded, setFontLoaded] = useState(false); // tracks if pliant.ttf has loaded
 
   // --- state variables (changing these refreshes the ui) ---
-  const [stage, setStage] = useState('intro'); // 'intro', 'boarding', 'dock', or 'radar'
+  const [stage, setStage] = useState('intro'); // 'intro', 'auth', 'boarding', 'dock', 'radar', or 'settings'
+  const [currentUser, setCurrentUser] = useState(null); // the firebase user object, once signed in
+  const [avatarId, setAvatarId] = useState('comet'); // matches AVATAR_PRESETS in AvatarPicker.js
   const [name, setName] = useState(''); // alias string the user types in
   const [pin, setPin] = useState(''); // 6-digit string the user types in
   const [connectError, setConnectError] = useState(null); // true if the socket failed to connect
@@ -155,8 +195,11 @@ export default function App() { // main function react native renders to the scr
         duration: 2900,
         useNativeDriver: false // must be false to animate 'width'
       }).start(() => {
-        // once the bar finishes filling, fade to boarding
-        crossfadeTo('boarding');
+        // once the bar finishes filling, fade to the sign-in screen —
+        // used to go straight to 'boarding', now 'auth' sits in front of
+        // it so nobody gets into the app without signing in or at least
+        // going through as a guest
+        crossfadeTo('auth');
       });
     }
   }, [fontLoaded]);
@@ -278,26 +321,27 @@ export default function App() { // main function react native renders to the scr
   };
 
   // --- network: catching files ---
-  const acceptAndDownload = async (transferId) => { // when the laptop throws something back to the phone
+  const acceptAndDownload = async (transferId, fileName) => { // when the laptop throws something back to the phone
     wsRef.current.send(JSON.stringify({
       type: 'accept_transfer',
       transferId
     }));
     setStatus('receiving...');
     try {
-      const destUri = FileSystem.cacheDirectory + `spatialdrop_${transferId}`; // temporary hidden folder path
-      const result = await FileSystem.downloadAsync( // download the heavy bytes
-        `http://${hostIpRef.current}:3000/api/download/${transferId}`,
+      const ext = fileName && fileName.includes('.') ? fileName.slice(fileName.lastIndexOf('.')) : '';
+      const destUri = FileSystem.cacheDirectory + `spatialdrop_${transferId}${ext}`; // ext goes HERE
+      const result = await FileSystem.downloadAsync(
+        `http://${hostIpRef.current}:3000/api/download/${transferId}`, // NOT here — plain UUID only
         destUri
       );
-      if (await Sharing.isAvailableAsync()) { // if the phone has a share menu
-        await Sharing.shareAsync(result.uri); // native "save to photos?" sheet
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(result.uri);
       }
       setStatus('');
-    } catch (err) { // wifi dropped mid-download
+    } catch (err) {
       setStatus('transfer lost to the void. try again.');
     } finally {
-      setIncomingFromId(null); // whatever happened, this peer is no longer actively sending to us
+      setIncomingFromId(null);
     }
   };
 
@@ -329,7 +373,7 @@ export default function App() { // main function react native renders to the scr
       setIncomingFromId(data.fromDeviceId ?? null);
 
       if (data.trusted) { // already accepted before
-        acceptAndDownload(data.transferId); // bypass the popup, download instantly
+        acceptAndDownload(data.transferId, data.fileNames?.[0]); // bypass the popup, download instantly
         return;
       }
 
@@ -351,7 +395,7 @@ export default function App() { // main function react native renders to the scr
           {
             text: 'accept',
             onPress: () => {
-              acceptAndDownload(data.transferId);
+              acceptAndDownload(data.transferId, data.fileNames?.[0]);
             }
           },
         ]
@@ -389,7 +433,8 @@ export default function App() { // main function react native renders to the scr
         pin: roomPin,
         role: 'mobile',
         deviceId: deviceIdRef.current,
-        label: name || 'node' // default alias
+        label: name || 'node', // default alias
+        avatarId // NEW — lets superhub.html (and eventually other peers) render your actual chosen avatar instead of a generic grey orb. server.js's room_update just needs to pass this field through on the peer object, same as it already does for label/deviceId — that's the one backend change this needs.
       }));
     };
 
@@ -596,313 +641,400 @@ export default function App() { // main function react native renders to the scr
   // graceful loading screen while the font initializes so it never crashes
   if (!fontLoaded) {
     return (
-      <View style={{ flex: 1, backgroundColor: COLORS.bg, justifyContent: 'center', alignItems: 'center' }}>
-        <Text style={{ color: COLORS.mutedText, fontSize: 10, letterSpacing: 2 }}>LOADING SYSTEM...</Text>
+      <View style={{ flex: 1, backgroundColor: theme.bg, justifyContent: 'center', alignItems: 'center' }}>
+        <Text style={{ color: theme.mutedText, fontSize: 10, letterSpacing: 2 }}>LOADING SYSTEM...</Text>
       </View>
     );
   }
 
   return (
-    <GestureHandlerRootView style={styles.safe}> {/* master wrapper, enables finger tracking */}
-      <TextInput // invisible keyboard listener
-        ref={pinInputRef} // lets us focus it programmatically
-        value={pin}
-        onChangeText={handlePinChange}
-        keyboardType="number-pad" // number-only keyboard
-        maxLength={6}
-        style={styles.hiddenInput} // throws it completely off screen, invisibly
-      />
+      <GestureHandlerRootView style={styles.safe}> {/* master wrapper, enables finger tracking */}
+        <TextInput // invisible keyboard listener
+          ref={pinInputRef} // lets us focus it programmatically
+          value={pin}
+          onChangeText={handlePinChange}
+          keyboardType="number-pad" // number-only keyboard
+          maxLength={6}
+          style={styles.hiddenInput} // throws it completely off screen, invisibly
+        />
 
-      <Animated.View // master wrapper for screen fades
-        style={[
-          styles.canvas,
-          { opacity: canvasOpacity } // bound to the fade engine
-        ]}
-      >
+        <Animated.View // master wrapper for screen fades
+          style={[
+            styles.canvas,
+            { opacity: canvasOpacity, backgroundColor: theme.bg } // bound to the fade engine, and now actually swaps with the toggle instead of staying stuck on whatever styles.canvas hardcodes
+          ]}
+        >
 
-        {/* --- stage 1: intro --- */}
-        {stage === 'intro' && (
-          <View style={styles.splashScreenContainer}>
+          {/* --- stage 1: intro --- */}
+          {stage === 'intro' && (
+            <View style={styles.splashScreenContainer}>
 
-            {/* center block: logo and loading bar */}
-            <View style={styles.centerBlock}>
-              <View style={styles.logoContainer}>
-                <Text style={styles.logoLight}>spatial</Text>
-                <Text style={styles.logoHeavy}>DROP</Text>
-              </View>
-
-              {/* the cinematic progress bar */}
-              <View style={styles.progressBarTrack}>
-                <Animated.View
-                  style={[
-                    styles.progressBarFill,
-                    {
-                      width: progressAnim.interpolate({
-                        inputRange: [0, 1],
-                        outputRange: ['0%', '100%']
-                      })
-                    }
-                  ]}
-                />
-              </View>
-            </View>
-
-            {/* bottom independent tagline */}
-            <View style={styles.bottomTaglineContainer}>
-              <Text style={styles.introTagline}>flick a file</Text>
-            </View>
-
-          </View>
-        )}
-
-        {/* --- stage 1.5: the loading transition --- */}
-        {stage === 'loading' && (
-          <View style={styles.centerBlock}>
-            <LumaLoader />
-          </View>
-        )}
-
-        {/* --- stage 2: boarding pass --- */}
-        {stage === 'boarding' && (
-          <View style={styles.centerBlock}>
-
-            {/* --- toggle backgrounds here --- */}
-            {/* <ConstellationBackground /> */}
-            <MatrixBackground typedName={name} />
-
-            <Text style={[styles.logoLight, { fontSize: 14, marginBottom: 40, opacity: 0.6 }]}>
-              welcome aboard.
-            </Text>
-            <TextInput
-              placeholder="identification:"
-              placeholderTextColor={COLORS.mutedText}
-              value={name}
-              onChangeText={setName}
-              style={styles.nameInput}
-              keyboardAppearance="dark"
-              autoCapitalize="none"
-              autoCorrect={false}
-            />
-            <Pressable
-              style={({ pressed }) => [styles.ctaButton, { opacity: pressed ? 0.5 : 1 }]}
-              onPress={() => {
-                if (name.trim().length > 0) {
-                  Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-                  crossfadeTo('dock');
-                }
-              }}
-            >
-              <Text style={styles.ctaText}>continue</Text>
-            </Pressable>
-          </View>
-        )}
-
-        {/* --- stage 3: the pin dock --- */}
-        {stage === 'dock' && (
-          <Animated.View // container that handles the automatic error shaking
-            style={[
-              styles.centerBlock,
-              { transform: [{ translateX: pinShakeAnim }] }
-            ]}
-          >
-            {/* --- placeholder for the 3 emoticons --- */}
-            <View style={{ flexDirection: 'row', gap: 15, marginBottom: 30 }}>
-              <Text style={{ fontSize: 25, color: COLORS.amber }}>⊹ ࣪ ﹏𓊝﹏𓂁﹏⊹ ࣪ ˖</Text>
-            </View>
-
-            <Text style={[styles.logoLight, { fontSize: 14, marginBottom: 40, opacity: 0.6 }]}>
-              enter docking node.
-            </Text>
-
-            <Pressable // tapping this opens the hidden keyboard automatically
-              style={styles.pinRow}
-              onPress={() => {
-                pinInputRef.current?.focus();
-              }}
-            >
-              {digitBoxes.map((d, i) => (
-                <View
-                  key={i}
-                  style={[styles.pinBox, { borderColor: d ? COLORS.boxBorderFilled : COLORS.boxBorder }]}
-                >
-                  <Text style={[styles.pinDigit, { color: d ? COLORS.text : COLORS.mutedText }]}>
-                    {d ?? '_'}
-                  </Text>
+              {/* center block: logo and loading bar */}
+              <View style={styles.centerBlock}>
+                <View style={styles.logoContainer}>
+                  <Text style={styles.logoLight}>spatial</Text>
+                  <Text style={styles.logoHeavy}>DROP</Text>
                 </View>
-              ))}
-            </Pressable>
-          </Animated.View>
-        )}
 
-        {/* --- STAGE 4: THE PLASMA FIELD (LIGHTNING) --- */}
-        {stage === 'radar' && (
-          <GestureDetector gesture={swipeGesture}>
-            <View style={styles.radarContainer}>
-              <GestureDetector gesture={tapGesture}>
-                <Svg width={windowWidth} height={windowHeight} style={StyleSheet.absoluteFill}>
-                  <Defs>
-                    <RadialGradient id="nodeGlowIdle" cx="50%" cy="50%" r="50%">
-                      <Stop offset="0%" stopColor={COLORS.mutedText} stopOpacity="0.5" />
-                      <Stop offset="100%" stopColor={COLORS.mutedText} stopOpacity="0" />
-                    </RadialGradient>
-                    <RadialGradient id="nodeGlowOutgoing" cx="50%" cy="50%" r="50%">
-                      <Stop offset="0%" stopColor={COLORS.amber} stopOpacity="0.6" />
-                      <Stop offset="100%" stopColor={COLORS.amber} stopOpacity="0" />
-                    </RadialGradient>
-                    <RadialGradient id="nodeGlowIncoming" cx="50%" cy="50%" r="50%">
-                      <Stop offset="0%" stopColor={COLORS.incomingGlow} stopOpacity="0.6" />
-                      <Stop offset="100%" stopColor={COLORS.incomingGlow} stopOpacity="0" />
-                    </RadialGradient>
-                    <RadialGradient id="youGrad" cx="50%" cy="50%" r="50%">
-                      <Stop offset="0%" stopColor={COLORS.amber} stopOpacity="0.3" />
-                      <Stop offset="100%" stopColor={COLORS.amber} stopOpacity="0" />
-                    </RadialGradient>
-                  </Defs>
-
-                  {/* 1. STRUCTURED SENSOR-FIELD DOTS — replaces the old 52 random dust
-                      specks, which left huge dead-black patches and was a big part of
-                      why the screen read as empty/unfinished. a faint, even grid reads
-                      as texture instead of void, and runs the full height so it fills
-                      the space behind the anchor too */}
-                  {GRID_DOTS.map((dot, i) => (
-                    <Circle
-                      key={`grid-${i}`}
-                      cx={dot.x}
-                      cy={dot.y}
-                      r={dot.r}
-                      fill={COLORS.text}
-                      opacity={dot.o}
-                    />
-                  ))}
-
-                  {/* 1.5 CORNER FRAME — hairline brackets so the canvas reads as a
-                      contained instrument display instead of just fading into black
-                      at the edges. purely decorative, costs nothing */}
-                  {[
-                    { x: 20, y: 54, dx: 1, dy: 1 }, // top-left
-                    { x: windowWidth - 20, y: 54, dx: -1, dy: 1 }, // top-right
-                    { x: 20, y: windowHeight - 36, dx: 1, dy: -1 }, // bottom-left
-                    { x: windowWidth - 20, y: windowHeight - 36, dx: -1, dy: -1 } // bottom-right
-                  ].map((c, i) => (
-                    <Path
-                      key={`corner-${i}`}
-                      d={`M ${c.x} ${c.y + 22 * c.dy} L ${c.x} ${c.y} L ${c.x + 22 * c.dx} ${c.y}`}
-                      stroke={COLORS.boxBorder}
-                      strokeWidth={1}
-                      fill="none"
-                      opacity={0.6}
-                    />
-                  ))}
-
-                  {/* 2 & 3. PEER CONSTELLATION — orbiting nodes, and the swipe-triggered strike */}
-                  <PeerConstellation
-                    peers={peers}
-                    getSlotFor={getSlotFor}
-                    getPeerScale={getPeerScale}
-                    getPeerBreathe={getPeerBreathe}
-                    targetId={targetId}
-                    incomingFromId={incomingFromId}
-                    pulseAnim={pulseAnim}
-                    boomAnim={boomAnim}
-                    strikeTargets={strikeTargets}
-                    pin={pin}
-                  />
-
-                  {/* 4. THE ANCHOR INSTRUMENT CORE — fully on-screen now (see
-                      constants/layout.js), so its rings/gauge detail actually shows
-                      instead of being cropped by the bottom edge */}
-                  <SquigglyOrb
-                    cx={ANCHOR_X}
-                    cy={ANCHOR_Y}
-                    radius={ANCHOR_RADIUS}
-                    color={COLORS.idkman}
-                    pulseAnim={pulseAnim}
-                  />
-
-                  {/* 5. THE DISPATCH BLOOM — soft light lifting off the anchor as files launch */}
-                  {(dispatchSnapshot.length > 0 || shattered) && (
-                    <AnimatedCircle
-                      cx={ANCHOR_X}
-                      cy={ANCHOR_Y}
-                      r={boomAnim.interpolate({ inputRange: [0, 1], outputRange: [10, 220] })}
-                      fill={shattered ? COLORS.mutedText : COLORS.amber}
-                      opacity={boomAnim.interpolate({ inputRange: [0, 0.6, 1], outputRange: [0.35, 0.12, 0] })}
-                    />
-                  )}
-
-                  {/* 6. FAILURE SHARDS — fire outward along the 6 fixed angles from where the boom died */}
-                  {shattered && SHARD_ANGLES.map((angle, i) => {
-                    const dx = Math.cos(angle); // fixed per-shard direction, computed once at render
-                    const dy = Math.sin(angle);
-                    return (
-                      <AnimatedCircle
-                        key={`shard-${i}`}
-                        cx={shatterAnim.interpolate({ inputRange: [0, 1], outputRange: [ANCHOR_X, ANCHOR_X + dx * 110] })}
-                        cy={shatterAnim.interpolate({ inputRange: [0, 1], outputRange: [ANCHOR_Y, ANCHOR_Y + dy * 110] })}
-                        r={shatterAnim.interpolate({ inputRange: [0, 1], outputRange: [4, 1] })}
-                        fill={COLORS.mutedText}
-                        opacity={shatterAnim.interpolate({ inputRange: [0, 0.7, 1], outputRange: [0.8, 0.5, 0] })}
-                      />
-                    );
-                  })}
-                </Svg>
-              </GestureDetector>
-
-              {/* 5. FLOATING UI LABELS */}
-              <Animated.Text style={[styles.topLabel, { opacity: pulseAnim.interpolate({ inputRange: [0, 1], outputRange: [0.3, 0.7] }) }]}>
-                {selectedFiles.length > 0 ? 'launch code.' : 'flick a file.'}
-              </Animated.Text>
-
-              {peers.map((peer) => {
-                const pos = scatterPositionFor(getSlotFor(peer.deviceId), peers.length, pin);
-                const isTargeted = targetId === peer.deviceId;
-
-                return (
-                  <Text
-                    key={`label-${peer.deviceId}`}
+                {/* the cinematic progress bar */}
+                <View style={styles.progressBarTrack}>
+                  <Animated.View
                     style={[
-                      styles.peerLabel,
+                      styles.progressBarFill,
                       {
-                        left: pos.x - 40, // centers the 80px wide text box
-                        top: pos.y + 15, // drops text below the orb
-                        color: isTargeted ? COLORS.amber : COLORS.mutedText // highlights if targeted
+                        width: progressAnim.interpolate({
+                          inputRange: [0, 1],
+                          outputRange: ['0%', '100%']
+                        })
                       }
                     ]}
-                  >
-                    {peer.label}
-                  </Text>
-                );
-              })}
+                  />
+                </View>
+              </View>
 
-              {/* THE ARMED MANIFEST — files loaded and waiting, sitting still above the anchor */}
-              {selectedFiles.length > 0 && (
-                <DispatchManifest files={selectedFiles} boomAnim={boomAnim} dispatching={false} />
-              )}
-
-              {/* THE DISPATCHED MANIFEST — the same tags, now lifting off and dissolving */}
-              {dispatchSnapshot.length > 0 && (
-                <DispatchManifest files={dispatchSnapshot} boomAnim={boomAnim} dispatching={true} />
-              )}
-
-              {/* 6. BOTTOM HUD / ERRORS — frosted glass pill instead of bare floating text */}
-              <View style={styles.hud}>
-                {(ghostDropMsg || status || selectedFiles.length > 0) && (
-                  <BlurView intensity={35} tint="dark" style={styles.hudPill}>
-                    {ghostDropMsg ? (
-                      <Text style={[styles.caption, { color: COLORS.error }]}>{ghostDropMsg}</Text>
-                    ) : (
-                      <Text style={styles.caption}>
-                        {status || (selectedFiles.length > 0 ? `[ ${selectedFiles.length} FILE(S) ARMED ]` : '')}
-                      </Text>
-                    )}
-                  </BlurView>
-                )}
+              {/* bottom independent tagline */}
+              <View style={styles.bottomTaglineContainer}>
+                <Text style={styles.introTagline}>flick a file</Text>
               </View>
 
             </View>
-          </GestureDetector>
-        )}
-      </Animated.View>
-    </GestureHandlerRootView>
+          )}
+
+          {/* --- stage 1.5: the loading transition --- */}
+          {stage === 'loading' && (
+            <View style={styles.centerBlock}>
+              <LumaLoader />
+            </View>
+          )}
+
+          {/* --- stage 1.75: sign in --- */}
+          {/* sits between the intro splash and 'boarding' now — nobody gets
+              further into the app without either a real account or
+              tapping "continue as guest." onAuthed just advances the
+              stage exactly like the old progress-bar callback used to */}
+          {stage === 'auth' && (
+            <AuthScreen
+              onAuthed={(user) => {
+                setCurrentUser(user); // remember who's signed in for the rest of the session
+                syncUserToBackend({
+                  firebaseUid: user.uid,
+                  email: user.email,
+                  displayName: user.displayName,
+                  isGuest: user.isAnonymous,
+                  avatarId,
+                });
+                crossfadeTo('boarding');
+              }}
+            />
+          )}
+
+          {/* --- stage 2: boarding pass --- */}
+          {stage === 'boarding' && (
+            <View style={styles.centerBlock}>
+
+              {/* --- toggle backgrounds here --- */}
+              {/* <ConstellationBackground /> */}
+              <MatrixBackground typedName={name} />
+
+              <Text style={[styles.logoLight, { fontSize: 14, marginBottom: 40, opacity: 0.6 }]}>
+                welcome aboard.
+              </Text>
+              <TextInput
+                placeholder="identification:"
+                placeholderTextColor={theme.mutedText}
+                value={name}
+                onChangeText={setName}
+                style={styles.nameInput}
+                keyboardAppearance="dark"
+                autoCapitalize="none"
+                autoCorrect={false}
+              />
+              <Pressable
+                style={({ pressed }) => [styles.ctaButton, { opacity: pressed ? 0.5 : 1 }]}
+                onPress={() => {
+                  if (name.trim().length > 0) {
+                    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+                    crossfadeTo('dock');
+                  }
+                }}
+              >
+                <Text style={styles.ctaText}>continue</Text>
+              </Pressable>
+            </View>
+          )}
+
+          {/* --- stage 3: the pin dock --- */}
+          {stage === 'dock' && (
+            <Animated.View // container that handles the automatic error shaking
+              style={[
+                styles.centerBlock,
+                { transform: [{ translateX: pinShakeAnim }] }
+              ]}
+            >
+              {/* --- placeholder for the 3 emoticons --- */}
+              <View style={{ flexDirection: 'row', gap: 15, marginBottom: 30 }}>
+                <Text style={{ fontSize: 25, color: theme.amber }}>⊹ ࣪ ﹏𓊝﹏𓂁﹏⊹ ࣪ ˖</Text>
+              </View>
+
+              <Text style={[styles.logoLight, { fontSize: 14, marginBottom: 40, opacity: 0.6 }]}>
+                enter docking node.
+              </Text>
+
+              <Pressable // tapping this opens the hidden keyboard automatically
+                style={styles.pinRow}
+                onPress={() => {
+                  pinInputRef.current?.focus();
+                }}
+              >
+                {digitBoxes.map((d, i) => (
+                  <View
+                    key={i}
+                    style={[styles.pinBox, { borderColor: d ? theme.boxBorderFilled : theme.boxBorder }]}
+                  >
+                    <Text style={[styles.pinDigit, { color: d ? theme.text : theme.mutedText }]}>
+                      {d ?? '_'}
+                    </Text>
+                  </View>
+                ))}
+              </Pressable>
+            </Animated.View>
+          )}
+
+          {/* --- STAGE 4: THE PLASMA FIELD (LIGHTNING) --- */}
+          {stage === 'radar' && (
+            <GestureDetector gesture={swipeGesture}>
+              <View style={styles.radarContainer}>
+                <GestureDetector gesture={tapGesture}>
+                  <Svg width={windowWidth} height={windowHeight} style={StyleSheet.absoluteFill}>
+                    <Defs>
+                      <RadialGradient id="nodeGlowIdle" cx="50%" cy="50%" r="50%">
+                        <Stop offset="0%" stopColor={theme.mutedText} stopOpacity="0.5" />
+                        <Stop offset="100%" stopColor={theme.mutedText} stopOpacity="0" />
+                      </RadialGradient>
+                      <RadialGradient id="nodeGlowOutgoing" cx="50%" cy="50%" r="50%">
+                        <Stop offset="0%" stopColor={theme.amber} stopOpacity="0.6" />
+                        <Stop offset="100%" stopColor={theme.amber} stopOpacity="0" />
+                      </RadialGradient>
+                      <RadialGradient id="nodeGlowIncoming" cx="50%" cy="50%" r="50%">
+                        <Stop offset="0%" stopColor={theme.incomingGlow} stopOpacity="0.6" />
+                        <Stop offset="100%" stopColor={theme.incomingGlow} stopOpacity="0" />
+                      </RadialGradient>
+                      <RadialGradient id="youGrad" cx="50%" cy="50%" r="50%">
+                        <Stop offset="0%" stopColor={theme.amber} stopOpacity="0.3" />
+                        <Stop offset="100%" stopColor={theme.amber} stopOpacity="0" />
+                      </RadialGradient>
+                    </Defs>
+
+                    {/* 1. STRUCTURED SENSOR-FIELD DOTS — replaces the old 52 random dust
+                        specks, which left huge dead-black patches and was a big part of
+                        why the screen read as empty/unfinished. a faint, even grid reads
+                        as texture instead of void, and runs the full height so it fills
+                        the space behind the anchor too.
+                        recolored to theme.starGold instead of plain text-white — gives
+                        the radar screen a second, secondary-warm accent behind the
+                        cherry so it doesn't read as one single flat hue */}
+                    {GRID_DOTS.map((dot, i) => (
+                      <Circle
+                        key={`grid-${i}`}
+                        cx={dot.x}
+                        cy={dot.y}
+                        r={dot.r}
+                        fill={theme.starGold}
+                        opacity={dot.o}
+                      />
+                    ))}
+
+                    {/* 1.5 CORNER FRAME — hairline brackets so the canvas reads as a
+                        contained instrument display instead of just fading into black
+                        at the edges. purely decorative, costs nothing */}
+                    {[
+                      { x: 20, y: 54, dx: 1, dy: 1 }, // top-left
+                      { x: windowWidth - 20, y: 54, dx: -1, dy: 1 }, // top-right
+                      { x: 20, y: windowHeight - 36, dx: 1, dy: -1 }, // bottom-left
+                      { x: windowWidth - 20, y: windowHeight - 36, dx: -1, dy: -1 } // bottom-right
+                    ].map((c, i) => (
+                      <Path
+                        key={`corner-${i}`}
+                        d={`M ${c.x} ${c.y + 22 * c.dy} L ${c.x} ${c.y} L ${c.x + 22 * c.dx} ${c.y}`}
+                        stroke={theme.boxBorder}
+                        strokeWidth={1}
+                        fill="none"
+                        opacity={0.6}
+                      />
+                    ))}
+
+                    {/* 2 & 3. PEER CONSTELLATION — orbiting nodes, and the swipe-triggered strike */}
+                    <PeerConstellation
+                      peers={peers}
+                      getSlotFor={getSlotFor}
+                      getPeerScale={getPeerScale}
+                      getPeerBreathe={getPeerBreathe}
+                      targetId={targetId}
+                      incomingFromId={incomingFromId}
+                      pulseAnim={pulseAnim}
+                      boomAnim={boomAnim}
+                      strikeTargets={strikeTargets}
+                      pin={pin}
+                    />
+
+                    {/* 4. THE ANCHOR INSTRUMENT CORE — fully on-screen now (see
+                        constants/layout.js), so its rings/gauge detail actually shows
+                        instead of being cropped by the bottom edge */}
+                    <SquigglyOrb
+                      cx={ANCHOR_X}
+                      cy={ANCHOR_Y}
+                      radius={ANCHOR_RADIUS}
+                      color={theme.idkman}
+                      pulseAnim={pulseAnim}
+                    />
+
+                    {/* 5. THE DISPATCH BLOOM — soft light lifting off the anchor as files launch */}
+                    {(dispatchSnapshot.length > 0 || shattered) && (
+                      <AnimatedCircle
+                        cx={ANCHOR_X}
+                        cy={ANCHOR_Y}
+                        r={boomAnim.interpolate({ inputRange: [0, 1], outputRange: [10, 220] })}
+                        fill={shattered ? theme.mutedText : theme.amber}
+                        opacity={boomAnim.interpolate({ inputRange: [0, 0.6, 1], outputRange: [0.35, 0.12, 0] })}
+                      />
+                    )}
+
+                    {/* 6. FAILURE SHARDS — fire outward along the 6 fixed angles from where the boom died */}
+                    {shattered && SHARD_ANGLES.map((angle, i) => {
+                      const dx = Math.cos(angle); // fixed per-shard direction, computed once at render
+                      const dy = Math.sin(angle);
+                      return (
+                        <AnimatedCircle
+                          key={`shard-${i}`}
+                          cx={shatterAnim.interpolate({ inputRange: [0, 1], outputRange: [ANCHOR_X, ANCHOR_X + dx * 110] })}
+                          cy={shatterAnim.interpolate({ inputRange: [0, 1], outputRange: [ANCHOR_Y, ANCHOR_Y + dy * 110] })}
+                          r={shatterAnim.interpolate({ inputRange: [0, 1], outputRange: [4, 1] })}
+                          fill={theme.mutedText}
+                          opacity={shatterAnim.interpolate({ inputRange: [0, 0.7, 1], outputRange: [0.8, 0.5, 0] })}
+                        />
+                      );
+                    })}
+                  </Svg>
+                </GestureDetector>
+
+                {/* 5. FLOATING UI LABELS */}
+                <Animated.Text style={[styles.topLabel, { opacity: pulseAnim.interpolate({ inputRange: [0, 1], outputRange: [0.3, 0.7] }) }]}>
+                  {selectedFiles.length > 0 ? 'launch code.' : 'flick a file.'}
+                </Animated.Text>
+
+                {peers.map((peer) => {
+                  const pos = scatterPositionFor(getSlotFor(peer.deviceId), peers.length, pin);
+                  const isTargeted = targetId === peer.deviceId;
+
+                  return (
+                    <Text
+                      key={`label-${peer.deviceId}`}
+                      style={[
+                        styles.peerLabel,
+                        {
+                          left: pos.x - 40, // centers the 80px wide text box
+                          top: pos.y + 15, // drops text below the orb
+                          color: isTargeted ? theme.amber : theme.mutedText // highlights if targeted
+                        }
+                      ]}
+                    >
+                      {peer.label}
+                    </Text>
+                  );
+                })}
+
+                {/* THE ARMED MANIFEST — files loaded and waiting, sitting still above the anchor */}
+                {selectedFiles.length > 0 && (
+                  <DispatchManifest files={selectedFiles} boomAnim={boomAnim} dispatching={false} />
+                )}
+
+                {/* THE DISPATCHED MANIFEST — the same tags, now lifting off and dissolving */}
+                {dispatchSnapshot.length > 0 && (
+                  <DispatchManifest files={dispatchSnapshot} boomAnim={boomAnim} dispatching={true} />
+                )}
+
+                {/* 6. BOTTOM HUD / ERRORS — frosted glass pill instead of bare floating text */}
+                <View style={styles.hud}>
+                  {(ghostDropMsg || status || selectedFiles.length > 0) && (
+                    <BlurView intensity={35} tint="dark" style={styles.hudPill}>
+                      {ghostDropMsg ? (
+                        <Text style={[styles.caption, { color: theme.error }]}>{ghostDropMsg}</Text>
+                      ) : (
+                        <Text style={styles.caption}>
+                          {status || (selectedFiles.length > 0 ? `[ ${selectedFiles.length} FILE(S) ARMED ]` : '')}
+                        </Text>
+                      )}
+                    </BlurView>
+                  )}
+                </View>
+
+              </View>
+            </GestureDetector>
+          )}
+
+          {/* --- settings entry point --- */}
+          {/* deliberately kept OUTSIDE the swipeGesture's GestureDetector
+              above — sitting inside it risked the pan gesture on the whole
+              radar screen fighting with this being a simple tap. as its
+              own sibling, absolutely positioned in the top-right corner,
+              it never touches that gesture logic at all */}
+          {stage === 'radar' && (
+            <Pressable
+              onPress={() => crossfadeTo('settings')}
+              style={{ position: 'absolute', top: 50, right: 24, padding: 8 }}
+            >
+              <Text style={{ color: theme.mutedText, fontSize: 20 }}>⚙</Text>
+            </Pressable>
+          )}
+
+          {/* --- stage 5: settings / menu --- */}
+          {stage === 'settings' && (
+            <SettingsMenu
+              user={currentUser}
+              avatarId={avatarId}
+              onAvatarChange={(id) => {
+                setAvatarId(id);
+                if (currentUser) {
+                  syncUserToBackend({
+                    firebaseUid: currentUser.uid,
+                    email: currentUser.email,
+                    displayName: currentUser.displayName,
+                    isGuest: currentUser.isAnonymous,
+                    avatarId: id,
+                  });
+                }
+                // NEW — the join message only sends avatarId ONCE, at the
+                // moment you first connect to a room. changing it here in
+                // Settings updated your local UI and your account record,
+                // but nobody currently in your room ever heard about it —
+                // the peer list on their end (superhub.html's orbs, etc)
+                // kept showing whatever avatar you had when you joined.
+                // this pushes the change live if you're mid-session in a
+                // room; socket.js has a matching 'avatar_update' handler
+                // that updates the stored avatarId and re-broadcasts.
+                if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+                  wsRef.current.send(JSON.stringify({ type: 'avatar_update', avatarId: id }));
+                }
+              }}
+              onLoggedOut={() => {
+                setCurrentUser(null);
+                crossfadeTo('auth');
+              }}
+              onBack={() => crossfadeTo('radar')}
+            />
+          )}
+        </Animated.View>
+      </GestureHandlerRootView>
+  );
+}
+
+// the actual default export now — AppInner is the one doing all the work,
+// this just makes sure it renders as a genuine child of ThemeProvider so
+// useTheme() inside it is live instead of frozen on the default context
+export default function App() {
+  return (
+    <ThemeProvider>
+      <AppInner />
+    </ThemeProvider>
   );
 }
