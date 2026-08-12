@@ -90,23 +90,39 @@ export const styles = StyleSheet.create({
     fontWeight: '400' // understated, lighter than the old bold pill text
   },
 
-  pinRow: { // wrapper for the 6 boxes
+  pinRow: { // wrapper for the 6 digit slots
     flexDirection: 'row',
-    gap: 12 // exact native spacing between each box
+    gap: 20 // wider than the old boxed layout — these read as separate marks, not a joined pill row
   },
-  pinBox: {
-    width: 40,
-    height: 50,
-    backgroundColor: 'rgba(184, 142, 142, 0.05)',
-    borderRadius: 23,
-    borderWidth: 1,
+  // CHANGED — replaces the old bordered-pill pinBox. no box/background at
+  // all now, just a column: the digit itself, then a short underline.
+  pinDigitWrap: {
+    width: 22,
     alignItems: 'center',
-    justifyContent: 'center'
   },
   pinDigit: { // the number itself
     fontFamily: 'Pliant',
-    fontSize: 20, // large
-    fontWeight: '200' // thin
+    fontSize: 30, // bumped up — carries the "filled" weight on its own now that there's no box around it
+    height: 36, // fixed so an empty slot (no digit) doesn't collapse the row height
+  },
+  pinUnderline: { // the short mark under each digit — crimson once filled, dim grey while empty
+    width: 24,
+    height: 3,
+    borderRadius: 2,
+    marginTop: 6,
+  },
+  // NEW — the actual "room full"/wrong-pin error message. color gets
+  // overridden inline with theme.error at the call site (App.js), same
+  // pattern the rest of this file mostly ignores — this file hardcodes
+  // COLORS directly rather than being theme-aware, which is the real
+  // reason light mode never fully applied (separate task, not fixed here).
+  pinErrorText: {
+    fontFamily: 'Pliant',
+    fontSize: 11,
+    letterSpacing: 0.5,
+    textAlign: 'center',
+    marginTop: 24,
+    maxWidth: 260,
   },
 
   topLabel: { // the "flick to transmit" cue reserved by TOP_SAFE_ZONE
@@ -138,9 +154,44 @@ export const styles = StyleSheet.create({
 
   hud: { // bottom status area
     position: 'absolute', // locked to specific coords
-    bottom: 120, // fixed distance from the physical bottom edge
+    bottom: 100, // fixed distance from the physical bottom edge
     width: '100%', // spans full width so text can center
     alignItems: 'center'
+  },
+  // NEW — replaces the old hud pill (blur box + border) with plain
+  // floating text, same spot, no box around it at all. deliberately
+  // minimal — this only ever appears for a real error or transient
+  // status, not continuously.
+  hudText: {
+    position: 'absolute',
+    bottom: 100,
+    width: '100%',
+    textAlign: 'center',
+    fontSize: 11,
+    letterSpacing: 1,
+    fontWeight: '300'
+  },
+  // NEW — this was referenced in App.js (styles.hudPill on the BlurView
+  // wrapping the status text) but never actually defined anywhere in this
+  // file, meaning that pill has been rendering completely unstyled this
+  // whole time — no padding, no rounded corners, nothing. found while
+  // wiring up the Android blur fallback below, fixed here since it's the
+  // same spot.
+  hudPill: {
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 20,
+    overflow: 'hidden', // required for the blur (or its Android fallback fill) to respect the rounded corners
+    borderWidth: 1,
+    borderColor: COLORS.boxBorder,
+  },
+  // NEW — Android-only, layered on top of hudPill above. expo-blur's real
+  // blur is meaningfully more expensive on Android than iOS, and this pill
+  // can sit on screen continuously during a transfer, right alongside the
+  // radar screen's several other looping animations. a flat tinted fill
+  // reads close enough at a glance and costs basically nothing to render.
+  hudPillAndroidFallback: {
+    backgroundColor: 'rgba(18, 17, 16, 0.85)', // approximates COLORS.bg at high opacity, same visual weight as the dark blur tint
   },
   caption: { // status text
     fontFamily: 'Pliant',
