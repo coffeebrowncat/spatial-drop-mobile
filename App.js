@@ -9,7 +9,8 @@ import {
   Animated,
   StyleSheet,
   Alert,
-  Keyboard
+  Keyboard,
+  Platform
 } from 'react-native';
 import {
   Gesture,
@@ -34,6 +35,7 @@ import * as Haptics from 'expo-haptics';
 import * as Font from 'expo-font';
 import { BlurView } from 'expo-blur';
 
+
 // NOTE: COLORS import removed — App.js now reads everything through
 // theme (see useTheme() below) so the light/dark toggle actually reaches
 // every screen, not just Settings. constants/colors.js still exists and
@@ -47,11 +49,12 @@ import {
   ANCHOR_RADIUS
 } from './constants/layout';
 import { hashToUnit } from './utils/hash';
-import { scatterPositionFor, branchPathFor, GRID_DOTS, SHARD_ANGLES } from './utils/geometry';
+import { scatterPositionFor, branchPathFor, GLOW_STARS, SHARD_ANGLES } from './utils/geometry';
 import { generateId } from './utils/id';
 import { resolveIp } from './utils/network';
 import { AnimatedCircle, AnimatedPath, AnimatedLine } from './components/AnimatedPrimitives';
 import { MatrixBackground } from './components/MatrixBackground';
+import { StaticStarfield } from './components/StaticStarfield';
 import { styles } from './styles/appStyles';
 import { SquigglyOrb } from './components/SquigglyOrb';
 import { DispatchManifest } from './components/DispatchManifest';
@@ -59,6 +62,8 @@ import { PeerConstellation } from './components/PeerConstellation';
 import { ThemeProvider, useTheme } from './contexts/ThemeContext';
 import { AuthScreen } from './components/AuthScreen';
 import { SettingsMenu } from './components/SettingsMenu';
+import { AmbientGlow } from './components/AmbientGlow';
+import { CornerFrame } from './components/CornerFrame';
 
 // the RENDER-hosted backend, not the local laptop one — account/profile
 // stuff needs to work no matter what wifi network the phone is on, so
@@ -107,11 +112,22 @@ function AppInner() { // main function react native renders to the screen
   const [peers, setPeers] = useState([]); // other devices in the room
   const [status, setStatus] = useState(''); // tiny text prompt at the bottom
   const [selectedFiles, setSelectedFiles] = useState([]); // files picked from the gallery
-  const [targetId, setTargetId] = useState(null); // which specific orb the user tapped on
+  // CHANGED — was a single targetId (or null for "everyone"). generalized
+  // to an array so tapping multiple orbs sends to that whole subset in one
+  // go, instead of only ever being able to pick exactly one peer or
+  // broadcast to the entire room. empty array still means "everyone" —
+  // same default behavior as before, just no longer capped at one.
+  const [targetIds, setTargetIds] = useState([]); // deviceIds of the orbs the user has tapped on
   const [shattered, setShattered] = useState(false); // true briefly when a throw fails mid-flight
   const [dispatchSnapshot, setDispatchSnapshot] = useState([]); // files frozen at swipe-time, purely for the vanish animation
   const [strikeTargets, setStrikeTargets] = useState([]); // deviceIds the lightning strike is currently animating toward
   const [incomingFromId, setIncomingFromId] = useState(null); // deviceId currently sending files to us, or null
+  // NEW — the anchor's "history ring", straight out of the reference
+  // design (Spatial Drop.dc.html: this.state.history / bumpHistory()).
+  // a thin progress ring around the anchor that fills up 14% per send,
+  // wrapping back to a small sliver once it passes 100 — a visible sense
+  // of "this thing has been used" rather than a static instrument.
+  const [sentHistoryPct, setSentHistoryPct] = useState(22); // same starting value as the reference
 
   // --- physics/animation variables (changing these does not refresh the ui) ---
   const canvasOpacity = useRef(new Animated.Value(1)).current; // screen fade, starts fully visible
@@ -168,6 +184,23 @@ function AppInner() { // main function react native renders to the screen
   const hostIpRef = useRef(null); // holds the laptop's ip once firebase gives it to us
   const pinInputRef = useRef(null); // direct reference to the hidden keyboard input
 
+  // NEW — this is the REAL fix for "changing my avatar kicks me back to the
+  // radar screen." socket.onmessage (set up once, inside connectToRoom, the
+  // moment you first connect) captures whatever `handleIncoming` closure
+  // existed AT THAT MOMENT — which means it also freezes whatever `stage`
+  // was AT THAT MOMENT, forever, for the rest of that connection. since you
+  // always connect while stage is 'dock', that closure's `stage` reads as
+  // 'dock' PERMANENTLY, no matter what screen you actually navigate to
+  // afterward. so the room_update guard below was never really checking
+  // your current screen — it was checking a snapshot from the instant you
+  // typed your pin, which is always true. deviceIdRef above already solves
+  // this exact problem for deviceId; stageRef does the same thing for
+  // stage — a ref stays live across stale closures, state does not.
+  const stageRef = useRef(stage);
+  useEffect(() => {
+    stageRef.current = stage;
+  }, [stage]);
+
   // --- font loader logic ---
   useEffect(() => { // runs once when the app boots
     async function loadCustomFont() {
@@ -214,11 +247,25 @@ function AppInner() { // main function react native renders to the screen
       }),
     ]).start(() => { // once faded out...
       setStage(nextStage); // swap the ui layout behind the invisible curtain
-      Animated.timing(canvasOpacity, { // fade back in
-        toValue: 1,
-        duration: 250,
-        useNativeDriver: true
-      }).start();
+      // FIXED — the fade-back-in used to start on this exact same tick as
+      // setStage above. setState is async, so this kicked off a NATIVE-
+      // driven opacity animation immediately, while React was still in
+      // the middle of actually unmounting the old screen and mounting the
+      // new one underneath it — heaviest on the radar screen specifically
+      // (lots of animated SVG/gesture-handler nodes to tear down) swapping
+      // to settings (ScrollView, images, KeyboardAvoidingView to lay out).
+      // opacity was rising back to 1 before the new screen had actually
+      // finished being built, so you'd catch it still settling into place
+      // — that's the flash. requestAnimationFrame here gives React one
+      // frame to finish that commit before anything starts becoming
+      // visible again.
+      requestAnimationFrame(() => {
+        Animated.timing(canvasOpacity, { // fade back in
+          toValue: 1,
+          duration: 250,
+          useNativeDriver: true
+        }).start();
+      });
     });
   };
 
@@ -358,7 +405,13 @@ function AppInner() { // main function react native renders to the screen
         return p.deviceId !== deviceIdRef.current; // filter out our own device
       }));
 
-      if (stage !== 'radar') { // still on the pin screen
+      // FIXED — this used to check `stage` directly, which is permanently
+      // stale here (see stageRef's comment above — this is the actual bug,
+      // not just the 'radar'-vs-'dock' condition itself). now reads
+      // stageRef.current, which is kept live via the useEffect above, so
+      // this genuinely reflects whatever screen you're on right now instead
+      // of whatever screen you were on the moment you first connected.
+      if (stageRef.current === 'dock') { // still on the pin screen, this IS the "you just connected" moment
         Keyboard.dismiss();
         pinInputRef.current?.blur();
         crossfadeTo('radar'); // fade into the constellation canvas
@@ -411,6 +464,22 @@ function AppInner() { // main function react native renders to the screen
       }, 2500);
       return;
     }
+
+    // NEW — the server already broadcasts this the instant the other side
+    // hits decline (see socket.js's decline_transfer handler), but nothing
+    // on the phone was ever listening for it. the drop flow sets
+    // status('sent') the moment the upload POST finishes, which only means
+    // "the file left my phone," not "the other person actually took it" —
+    // so a decline was silently swallowed and the phone just kept showing
+    // "sent" forever, looking like it succeeded when it didn't.
+    if (data.type === 'transfer_declined') {
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error); // distinct from the success thud above
+      setStatus('declined');
+      setTimeout(() => {
+        setStatus(''); // erase after 2.5 seconds, same rhythm as 'caught'
+      }, 2500);
+      return;
+    }
   };
 
   // --- network: websocket handshake ---
@@ -419,6 +488,13 @@ function AppInner() { // main function react native renders to the screen
     const ip = await resolveIp(roomPin); // firebase lookup
 
     if (!ip) { // firebase couldn't find the laptop
+      // NEW — this is a DIFFERENT failure than the server-side room-full
+      // rejection (handleIncoming's data.error branch). that one happens
+      // AFTER connecting, once the server actually looks at your pin. this
+      // one happens BEFORE any connection even starts — firebase just has
+      // no laptop registered under this pin at all (typo, laptop's off,
+      // pin expired). was only shaking with zero explanation before.
+      setConnectError("can't find that room — check the pin and try again");
       triggerWrongPinShake();
       return;
     }
@@ -451,6 +527,7 @@ function AppInner() { // main function react native renders to the screen
   const handlePinChange = (text) => { // triggered every keystroke
     const digitsOnly = text.replace(/[^0-9]/g, '').slice(0, 6); // strip letters, cap at 6 characters
     setPin(digitsOnly);
+    setConnectError(null); // NEW — clear any stale "room full"/error text the moment they start retyping
     if (digitsOnly.length === 6) { // auto-connect, no submit button needed
       connectToRoom(digitsOnly);
     }
@@ -476,10 +553,46 @@ function AppInner() { // main function react native renders to the screen
       copyToCacheDirectory: true // required so react native can safely read the data
     });
 
+    // FIXED — this used to stop right here. the picker would open, you'd
+    // pick something, and then... nothing. the result was never read, so
+    // "files" was a dead end next to "photos" in the deploy-payload
+    // dialog. same merge logic as pickFromPhotos below (append + dedupe
+    // by uri + cap at 10), for consistency.
     if (!result.canceled) {
-      setSelectedFiles(result.assets);
-      setStatus('loaded. flick to drop.');
+      const normalized = result.assets.map((a) => ({
+        uri: a.uri,
+        name: a.name || 'file',
+        mimeType: a.mimeType || 'application/octet-stream'
+      }));
+      setSelectedFiles((prev) => {
+        const existingUris = new Set(prev.map((f) => f.uri));
+        const merged = prev.concat(normalized.filter((f) => !existingUris.has(f.uri)));
+        return merged.slice(0, 10);
+      });
     }
+  };
+
+  // NEW — Android-specific fix. expo-image-picker's `fileName` field on
+  // Android sometimes comes back as the media provider's own internal
+  // UUID (seen: cloud-backed Google Photos images) instead of the actual
+  // original filename — iOS's Photos framework doesn't have this
+  // problem, it reliably hands back real names like "IMG_1234.HEIC".
+  // no real person names a photo a bare hex UUID, so treat that shape as
+  // unreliable and synthesize a clean name instead of showing raw
+  // garbage in the file tray.
+  const looksLikeJunkName = (name) => {
+    if (!name) return true;
+    const withoutExt = name.includes('.') ? name.slice(0, name.lastIndexOf('.')) : name;
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(withoutExt);
+  };
+
+  const extensionForMime = (mimeType) => {
+    const knownExtensions = {
+      'image/jpeg': 'jpg', 'image/png': 'png', 'image/heic': 'heic', 'image/heif': 'heif',
+      'image/gif': 'gif', 'image/webp': 'webp',
+      'video/mp4': 'mp4', 'video/quicktime': 'mov', 'video/3gpp': '3gp'
+    };
+    return knownExtensions[mimeType] || (mimeType?.startsWith('video/') ? 'mp4' : 'jpg');
   };
 
   const pickFromPhotos = async () => { // standard camera roll logic
@@ -490,19 +603,35 @@ function AppInner() { // main function react native renders to the screen
 
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ['images', 'videos'],
-      allowsMultipleSelection: true
+      allowsMultipleSelection: true,
+      selectionLimit: 10 // explicit — was relying on the platform default (0/unlimited), made it match "up to 10" on purpose
     });
 
     if (!result.canceled) {
       const normalized = result.assets.map((a, i) => { // format for our http route
+        const mimeType = a.mimeType || (a.type === 'video' ? 'video/mp4' : 'image/jpeg'); // fallback format
+        // CHANGED — was `a.fileName || fallback`, which only caught a
+        // MISSING name. a present-but-junk UUID name (see above) sailed
+        // straight through. now anything that looks like junk also gets
+        // the synthesized name — and that fallback now carries a real
+        // extension (derived from mimeType) instead of no extension at
+        // all, so a saved file still opens correctly on the other end.
+        const name = looksLikeJunkName(a.fileName)
+          ? `photo_${Date.now()}_${i}.${extensionForMime(mimeType)}`
+          : a.fileName;
         return {
           uri: a.uri, // physical path on the phone
-          name: a.fileName || `photo_${Date.now()}_${i}`, // fallback name if missing
-          mimeType: a.mimeType || (a.type === 'video' ? 'video/mp4' : 'image/jpeg') // fallback format
+          name,
+          mimeType
         };
       });
-      setSelectedFiles(normalized);
-      setStatus('loaded. flick to drop.');
+      // CHANGED — same fix as pickFromFiles: append + dedupe + cap at 10,
+      // instead of wholesale replacing the tray on every pick.
+      setSelectedFiles((prev) => {
+        const existingUris = new Set(prev.map((f) => f.uri));
+        const merged = prev.concat(normalized.filter((f) => !existingUris.has(f.uri)));
+        return merged.slice(0, 10);
+      });
     }
   };
 
@@ -514,9 +643,9 @@ function AppInner() { // main function react native renders to the screen
 
     const dispatched = selectedFiles; // freeze what's being sent before the tray empties
     setDispatchSnapshot(dispatched); // hands these off to the vanish animation
-    setStrikeTargets(targetId ? [targetId] : peers.map((p) => p.deviceId)); // one bolt if targeted, one to everyone if broadcasting
+    setStrikeTargets(targetIds.length > 0 ? targetIds : peers.map((p) => p.deviceId)); // one bolt per targeted orb, or one to everyone if broadcasting
     setSelectedFiles([]); // empty the tray the instant the flick registers, not after upload finishes
-    setTargetId(null); // un-target the orb
+    setTargetIds([]); // un-target every orb
 
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy); // massive physical thud
     setTimeout(() => {
@@ -535,6 +664,13 @@ function AppInner() { // main function react native renders to the screen
       setStrikeTargets([]); // strike has landed, stop rendering it
     });
 
+    // bump the history ring the moment the strike fires — matches the
+    // reference's bumpHistory() call timing (right alongside the send)
+    setSentHistoryPct((v) => {
+      const next = v + 14;
+      return next > 100 ? 16 : next;
+    });
+
     const formData = new FormData(); // standard web payload container
     dispatched.forEach((f) => {
       formData.append('files', {
@@ -546,8 +682,13 @@ function AppInner() { // main function react native renders to the screen
 
     formData.append('roomId', pin); // where the server should send it
     formData.append('deviceId', deviceIdRef.current); // who we are
-    if (targetId) { // tapped a specific orb
-      formData.append('targetId', targetId);
+    if (targetIds.length > 0) { // tapped one or more specific orbs
+      // CHANGED — was a single 'targetId' field. multipart form fields
+      // don't reliably collapse repeated same-name entries into an array
+      // across every parser, so this sends one JSON-encoded field instead
+      // of gambling on that — see transferController.js for the other
+      // half of this (JSON.parse + an .includes() check instead of ===).
+      formData.append('targetIds', JSON.stringify(targetIds));
     }
 
     try {
@@ -625,10 +766,19 @@ function AppInner() { // main function react native renders to the screen
       }
     });
 
-    // hit the same orb twice -> unselect it. hit a new orb -> select it.
-    setTargetId((current) => {
-      return hit === current ? null : hit;
-    });
+    if (!hit) {
+      setTargetIds([]); // tapped empty space — same "cancel" behavior as before, now clearing the whole selection instead of just one id
+      return;
+    }
+
+    // CHANGED — this used to just overwrite the single targetId, so
+    // tapping a second orb silently dropped the first one. now each tap
+    // toggles that ONE orb in/out of the selection, leaving everyone
+    // else's state untouched: tap 3 different orbs and all 3 stay
+    // selected, tap one of them again and only that one drops out.
+    setTargetIds((current) =>
+      current.includes(hit) ? current.filter((id) => id !== hit) : [...current, hit]
+    );
   });
 
   // array of 6 items. if 'pin' is "12", creates ['1', '2', null, null, null, null]
@@ -689,6 +839,7 @@ function AppInner() { // main function react native renders to the screen
                       }
                     ]}
                   />
+                  <AmbientGlow />
                 </View>
               </View>
 
@@ -771,6 +922,12 @@ function AppInner() { // main function react native renders to the screen
                 { transform: [{ translateX: pinShakeAnim }] }
               ]}
             >
+              {/* NEW — this screen used to be totally flat black, no
+                  atmosphere at all, unlike boarding (hex rain) and radar
+                  (scattered stars). StaticStarfield already existed,
+                  built and ready, just never actually mounted anywhere
+                  in the app until now. */}
+              <StaticStarfield />
               {/* --- placeholder for the 3 emoticons --- */}
               <View style={{ flexDirection: 'row', gap: 15, marginBottom: 30 }}>
                 <Text style={{ fontSize: 25, color: theme.amber }}>⊹ ࣪ ﹏𓊝﹏𓂁﹏⊹ ࣪ ˖</Text>
@@ -787,16 +944,33 @@ function AppInner() { // main function react native renders to the screen
                 }}
               >
                 {digitBoxes.map((d, i) => (
-                  <View
-                    key={i}
-                    style={[styles.pinBox, { borderColor: d ? theme.boxBorderFilled : theme.boxBorder }]}
-                  >
-                    <Text style={[styles.pinDigit, { color: d ? theme.text : theme.mutedText }]}>
-                      {d ?? '_'}
+                  // CHANGED — was a bordered pill (box + outline) around each
+                  // digit. swapped for the plain "digit + underline" style:
+                  // no box at all, just a big number with a short line under
+                  // it that lights up crimson once that slot is filled.
+                  <View key={i} style={styles.pinDigitWrap}>
+                    <Text style={[styles.pinDigit, { color: d ? theme.text : theme.mutedText, fontWeight: '300' }]}>
+                      {d ?? ''}
                     </Text>
+                    <View style={[styles.pinUnderline, { backgroundColor: d ? theme.amber : theme.boxBorderFilled }]} />
                   </View>
                 ))}
               </Pressable>
+              {/* NEW — connectError was already being SET (see handleIncoming
+                  above, data.error branch) but never actually rendered
+                  anywhere, so a room-full rejection just silently shook the
+                  pin boxes with no explanation. this is the missing piece. */}
+              {/* !!() — same defensive fix as ghostDropMsg/status below.
+                  connectError gets set from data.error off the socket; if
+                  the server ever sent an empty string there instead of
+                  null, `'' && (...)` would render the bare string '' and
+                  trip the same "Text strings must be rendered within a
+                  <Text> component" error. */}
+              {!!connectError && (
+                <Text style={[styles.pinErrorText, { color: theme.error }]}>
+                  {connectError}
+                </Text>
+              )}
             </Animated.View>
           )}
 
@@ -804,12 +978,20 @@ function AppInner() { // main function react native renders to the screen
           {stage === 'radar' && (
             <GestureDetector gesture={swipeGesture}>
               <View style={styles.radarContainer}>
+                {/* NEW — trying the radar screen against pitch black
+                    specifically (not the theme's #121110), scoped to just
+                    this screen — other stages still use theme.bg */}
+                <View style={[StyleSheet.absoluteFill, { backgroundColor: '#000000' }]} />
+                <CornerFrame color={theme.boxBorder} />
                 <GestureDetector gesture={tapGesture}>
                   <Svg width={windowWidth} height={windowHeight} style={StyleSheet.absoluteFill}>
                     <Defs>
+                      {/* CHANGED BACK — was the reference's literal magenta
+                          (#E9389F), now matches SquigglyOrb's cherry
+                          RING_ACCENT (#990433) instead */}
                       <RadialGradient id="nodeGlowIdle" cx="50%" cy="50%" r="50%">
-                        <Stop offset="0%" stopColor={theme.mutedText} stopOpacity="0.5" />
-                        <Stop offset="100%" stopColor={theme.mutedText} stopOpacity="0" />
+                        <Stop offset="0%" stopColor="#990433" stopOpacity="0.5" />
+                        <Stop offset="100%" stopColor="#990433" stopOpacity="0" />
                       </RadialGradient>
                       <RadialGradient id="nodeGlowOutgoing" cx="50%" cy="50%" r="50%">
                         <Stop offset="0%" stopColor={theme.amber} stopOpacity="0.6" />
@@ -823,45 +1005,49 @@ function AppInner() { // main function react native renders to the screen
                         <Stop offset="0%" stopColor={theme.amber} stopOpacity="0.3" />
                         <Stop offset="100%" stopColor={theme.amber} stopOpacity="0" />
                       </RadialGradient>
+                      {/* CHANGED — first version of this halo (0.9 opacity at
+                          center, 4x the core radius) is what made the stars
+                          read as solid gold blobs instead of a soft glow.
+                          pulled the peak opacity way down and tightened the
+                          falloff so it's a faint haze around a tiny point,
+                          not a visible disc of its own. */}
+                      <RadialGradient id="starGlow" cx="50%" cy="50%" r="50%">
+                        <Stop offset="0%" stopColor={theme.starGold} stopOpacity="0.45" />
+                        <Stop offset="40%" stopColor={theme.starGold} stopOpacity="0.12" />
+                        <Stop offset="100%" stopColor={theme.starGold} stopOpacity="0" />
+                      </RadialGradient>
                     </Defs>
 
-                    {/* 1. STRUCTURED SENSOR-FIELD DOTS — replaces the old 52 random dust
-                        specks, which left huge dead-black patches and was a big part of
-                        why the screen read as empty/unfinished. a faint, even grid reads
-                        as texture instead of void, and runs the full height so it fills
-                        the space behind the anchor too.
-                        recolored to theme.starGold instead of plain text-white — gives
-                        the radar screen a second, secondary-warm accent behind the
-                        cherry so it doesn't read as one single flat hue */}
-                    {GRID_DOTS.map((dot, i) => (
-                      <Circle
-                        key={`grid-${i}`}
-                        cx={dot.x}
-                        cy={dot.y}
-                        r={dot.r}
-                        fill={theme.starGold}
-                        opacity={dot.o}
-                      />
-                    ))}
-
-                    {/* 1.5 CORNER FRAME — hairline brackets so the canvas reads as a
-                        contained instrument display instead of just fading into black
-                        at the edges. purely decorative, costs nothing */}
-                    {[
-                      { x: 20, y: 54, dx: 1, dy: 1 }, // top-left
-                      { x: windowWidth - 20, y: 54, dx: -1, dy: 1 }, // top-right
-                      { x: 20, y: windowHeight - 36, dx: 1, dy: -1 }, // bottom-left
-                      { x: windowWidth - 20, y: windowHeight - 36, dx: -1, dy: -1 } // bottom-right
-                    ].map((c, i) => (
-                      <Path
-                        key={`corner-${i}`}
-                        d={`M ${c.x} ${c.y + 22 * c.dy} L ${c.x} ${c.y} L ${c.x + 22 * c.dx} ${c.y}`}
-                        stroke={theme.boxBorder}
-                        strokeWidth={1}
-                        fill="none"
-                        opacity={0.6}
-                      />
-                    ))}
+                    {/* 1. SCATTERED GLOWING STARS — replaces the uniform sensor-field
+                        grid. back to random placement (like the very first pass),
+                        but each star is now a real two-layer glow (soft halo +
+                        bright core, both theme.starGold) instead of a single flat
+                        dot, and actually twinkles — each star is bucketed into one
+                        of the 6 shared dustTwinkleRef loops (built earlier, never
+                        actually wired to anything on screen until now) so the
+                        field visibly breathes instead of sitting static. */}
+                    {/* CHANGED — dropped the separate halo circle per star
+                        (was 2 AnimatedCircle per star, now 1). every extra
+                        JS-driven animated shape is thread work competing
+                        with the sweep's own per-frame path recompute —
+                        this glow was marginal at this size and not worth
+                        doubling the shape count for. */}
+                    {GLOW_STARS.map((star, i) => {
+                      const twinkle = dustTwinkleRef.current[star.bucket].interpolate({
+                        inputRange: [0, 1],
+                        outputRange: [star.o * 0.25, star.o]
+                      });
+                      return (
+                        <AnimatedCircle
+                          key={`star-${i}`}
+                          cx={star.x}
+                          cy={star.y}
+                          r={star.r * 1.4}
+                          fill={theme.starGold}
+                          opacity={twinkle}
+                        />
+                      );
+                    })}
 
                     {/* 2 & 3. PEER CONSTELLATION — orbiting nodes, and the swipe-triggered strike */}
                     <PeerConstellation
@@ -869,7 +1055,7 @@ function AppInner() { // main function react native renders to the screen
                       getSlotFor={getSlotFor}
                       getPeerScale={getPeerScale}
                       getPeerBreathe={getPeerBreathe}
-                      targetId={targetId}
+                      targetIds={targetIds}
                       incomingFromId={incomingFromId}
                       pulseAnim={pulseAnim}
                       boomAnim={boomAnim}
@@ -880,12 +1066,15 @@ function AppInner() { // main function react native renders to the screen
                     {/* 4. THE ANCHOR INSTRUMENT CORE — fully on-screen now (see
                         constants/layout.js), so its rings/gauge detail actually shows
                         instead of being cropped by the bottom edge */}
+                    {/* NOTE — no longer takes a `color` prop: it now renders
+                        the reference design's exact literal colors
+                        internally (see SquigglyOrb.js), not the app theme */}
                     <SquigglyOrb
                       cx={ANCHOR_X}
                       cy={ANCHOR_Y}
                       radius={ANCHOR_RADIUS}
-                      color={theme.idkman}
                       pulseAnim={pulseAnim}
+                      historyPct={sentHistoryPct}
                     />
 
                     {/* 5. THE DISPATCH BLOOM — soft light lifting off the anchor as files launch */}
@@ -918,13 +1107,13 @@ function AppInner() { // main function react native renders to the screen
                 </GestureDetector>
 
                 {/* 5. FLOATING UI LABELS */}
-                <Animated.Text style={[styles.topLabel, { opacity: pulseAnim.interpolate({ inputRange: [0, 1], outputRange: [0.3, 0.7] }) }]}>
+                <Animated.Text style={[styles.topLabel, { color: '#BAAAA6', opacity: pulseAnim.interpolate({ inputRange: [0, 1], outputRange: [0.3, 0.7] }) }]}>
                   {selectedFiles.length > 0 ? 'launch code.' : 'flick a file.'}
                 </Animated.Text>
 
                 {peers.map((peer) => {
                   const pos = scatterPositionFor(getSlotFor(peer.deviceId), peers.length, pin);
-                  const isTargeted = targetId === peer.deviceId;
+                  const isTargeted = targetIds.includes(peer.deviceId);
 
                   return (
                     <Text
@@ -933,8 +1122,8 @@ function AppInner() { // main function react native renders to the screen
                         styles.peerLabel,
                         {
                           left: pos.x - 40, // centers the 80px wide text box
-                          top: pos.y + 15, // drops text below the orb
-                          color: isTargeted ? theme.amber : theme.mutedText // highlights if targeted
+                          top: pos.y + 22, // drops text below the orb — nudged down a bit more so the node itself doesn't sit on top of the label
+                          color: isTargeted ? theme.amber : '#C4B3B0' // literal reference peer-label color when idle, still highlights amber when targeted
                         }
                       ]}
                     >
@@ -953,20 +1142,30 @@ function AppInner() { // main function react native renders to the screen
                   <DispatchManifest files={dispatchSnapshot} boomAnim={boomAnim} dispatching={true} />
                 )}
 
-                {/* 6. BOTTOM HUD / ERRORS — frosted glass pill instead of bare floating text */}
-                <View style={styles.hud}>
-                  {(ghostDropMsg || status || selectedFiles.length > 0) && (
-                    <BlurView intensity={35} tint="dark" style={styles.hudPill}>
-                      {ghostDropMsg ? (
-                        <Text style={[styles.caption, { color: theme.error }]}>{ghostDropMsg}</Text>
-                      ) : (
-                        <Text style={styles.caption}>
-                          {status || (selectedFiles.length > 0 ? `[ ${selectedFiles.length} FILE(S) ARMED ]` : '')}
-                        </Text>
-                      )}
-                    </BlurView>
-                  )}
-                </View>
+                {/* NEW — brought error/status feedback back, but deliberately
+                    minimal this time: plain floating text, no pill/box/blur,
+                    and no "[N FILE(S) ARMED]" line at all (the bottom tray
+                    already shows what's loaded, so that was pure duplicate
+                    clutter). only ever renders when there's an actual error
+                    or a real transient event (sent/caught/declined/
+                    receiving) — invisible the rest of the time, unlike the
+                    old pill which sat on screen continuously whenever files
+                    were armed. */}
+                {/* FIXED — was `{(ghostDropMsg || status) && (...)}`. when
+                    ghostDropMsg is null AND status is '' (its default/reset
+                    value, i.e. most of the time), `null || ''` evaluates to
+                    '' — a STRING, not false. React Native then tries to
+                    render that bare empty string as a child of the
+                    surrounding View instead of skipping it, which is
+                    exactly the "Text strings must be rendered within a
+                    <Text> component" crash. wrapping the whole condition in
+                    !!(...) forces a real boolean, so the falsy case is
+                    `false` (which React silently skips) instead of ''. */}
+                {!!(ghostDropMsg || status) && (
+                  <Text style={[styles.hudText, { color: ghostDropMsg ? theme.error : theme.mutedText }]}>
+                    {ghostDropMsg || status}
+                  </Text>
+                )}
 
               </View>
             </GestureDetector>
@@ -981,9 +1180,22 @@ function AppInner() { // main function react native renders to the screen
           {stage === 'radar' && (
             <Pressable
               onPress={() => crossfadeTo('settings')}
-              style={{ position: 'absolute', top: 50, right: 24, padding: 8 }}
+              style={{ position: 'absolute', top: 53, right: 24, padding: 8 }} // nudged down one notch — was sitting too close to the top edge
             >
-              <Text style={{ color: theme.mutedText, fontSize: 20 }}>⚙</Text>
+              {/* CHANGED — was a plain "⚙" gear character. matches the
+                  crosshair/target icon from the redesign reference instead
+                  — a thin outer ring with four short tick marks, same
+                  "instrument" language as the new anchor orb's single ring
+                  and the radar sweep, rather than a generic settings glyph
+                  that doesn't relate to the rest of the screen at all. */}
+              <Svg width={26} height={26} viewBox="0 0 26 26">
+                <Circle cx={13} cy={13} r={9} stroke="#BAAAA6" strokeWidth={1.4} fill="none" opacity={0.9} />
+                <Circle cx={13} cy={13} r={1.6} fill="#BAAAA6" opacity={0.9} />
+                <Line x1={13} y1={0.5} x2={13} y2={4} stroke="#BAAAA6" strokeWidth={1.4} opacity={0.9} />
+                <Line x1={13} y1={22} x2={13} y2={25.5} stroke="#BAAAA6" strokeWidth={1.4} opacity={0.9} />
+                <Line x1={0.5} y1={13} x2={4} y2={13} stroke="#BAAAA6" strokeWidth={1.4} opacity={0.9} />
+                <Line x1={22} y1={13} x2={25.5} y2={13} stroke="#BAAAA6" strokeWidth={1.4} opacity={0.9} />
+              </Svg>
             </Pressable>
           )}
 
@@ -1019,6 +1231,21 @@ function AppInner() { // main function react native renders to the screen
               onLoggedOut={() => {
                 setCurrentUser(null);
                 crossfadeTo('auth');
+              }}
+              // NEW — fires when a guest upgrades to a real account (or logs
+              // into an existing one) right inside Settings, without ever
+              // leaving this screen. App.js is the one holding currentUser,
+              // so SettingsMenu can't just update its own copy — it has to
+              // hand the new user object back up here.
+              onUserUpdated={(user) => {
+                setCurrentUser(user);
+                syncUserToBackend({
+                  firebaseUid: user.uid,
+                  email: user.email,
+                  displayName: user.displayName,
+                  isGuest: user.isAnonymous,
+                  avatarId,
+                });
               }}
               onBack={() => crossfadeTo('radar')}
             />
