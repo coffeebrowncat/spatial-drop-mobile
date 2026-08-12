@@ -31,7 +31,7 @@
 // ============================================================
 
 import React from 'react';
-import { View, Image, Pressable, StyleSheet } from 'react-native';
+import { View, Image, Pressable, StyleSheet, ScrollView } from 'react-native';
 import { COLORS } from '../constants/colors';
 
 export const AVATAR_PRESETS = [
@@ -50,9 +50,18 @@ export const AVATAR_PRESETS = [
   // { id: 'smirkingCat', image: require('../assets/avatars/smirkingCat.png') },
 ];
 
+// CHANGED — was a flexWrap grid (all 9 avatars visible at once, wrapping to
+// 3 rows). that's what was making the card so tall. now a single row that
+// scrolls horizontally instead — only ~4 fit in view at a time (card width
+// minus padding), the rest scroll. compresses the card down to one row's
+// height regardless of how many presets exist.
 export function AvatarPicker({ selectedId, onSelect }) {
   return (
-    <View style={styles.row}>
+    <ScrollView
+      horizontal
+      showsHorizontalScrollIndicator={false}
+      contentContainerStyle={styles.row}
+    >
       {AVATAR_PRESETS.map((preset) => {
         const isSelected = preset.id === selectedId;
         return (
@@ -61,14 +70,23 @@ export function AvatarPicker({ selectedId, onSelect }) {
             onPress={() => onSelect(preset.id)}
             style={[
               styles.avatarWrap,
-              { borderColor: isSelected ? COLORS.amber : COLORS.boxBorder },
+              // CHANGED — was COLORS.amber (cherry) on the selected one,
+              // plus a matching cherry shadow glow below — too much pink
+              // stacked on top of the ring, card border, and gradient
+              // corner all at once. selection now reads via a lighter
+              // grey border instead, no glow.
+              { borderColor: isSelected ? '#8A8580' : COLORS.boxBorder },
             ]}
           >
             <Image source={preset.image} style={styles.avatarImage} resizeMode="cover" />
+            {/* NEW — same dark scrim as the big profile avatar (SettingsMenu)
+                — the white-background line art was reading as a row of
+                bright headlights against the dark card. */}
+            <View style={styles.avatarDimOverlay} pointerEvents="none" />
           </Pressable>
         );
       })}
-    </View>
+    </ScrollView>
   );
 }
 
@@ -85,14 +103,13 @@ export function getAvatarImage(avatarId) {
 const styles = StyleSheet.create({
   row: {
     flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 12,
-    justifyContent: 'center',
+    gap: 14,
+    paddingHorizontal: 2, // keeps the first/last ring's glow from clipping against the scroll edge
   },
   avatarWrap: {
-    width: 52,
-    height: 52,
-    borderRadius: 26,
+    width: 56,
+    height: 56,
+    borderRadius: 28,
     borderWidth: 2,
     alignItems: 'center',
     justifyContent: 'center',
@@ -107,8 +124,15 @@ const styles = StyleSheet.create({
     // transparent art required on your end anymore. resizeMode "cover"
     // (set above) fills the full circle without stretching, cropping
     // any excess instead of leaving gaps.
-    width: 50,
-    height: 50,
-    borderRadius: 25,
+    width: 54,
+    height: 54,
+    borderRadius: 27,
+  },
+  avatarDimOverlay: {
+    position: 'absolute',
+    width: 54,
+    height: 54,
+    borderRadius: 27,
+    backgroundColor: 'rgba(0, 0, 0, 0.32)',
   },
 });
