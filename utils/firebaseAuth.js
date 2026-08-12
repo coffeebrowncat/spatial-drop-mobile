@@ -15,6 +15,8 @@
 
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import {
+  initializeAuth,
+  getReactNativePersistence,
   getAuth,
   createUserWithEmailAndPassword,
   signInWithEmailAndPassword,
@@ -22,7 +24,10 @@ import {
   onAuthStateChanged,
   updateProfile,
   signOut,
+  linkWithCredential,
+  EmailAuthProvider,
 } from 'firebase/auth';
+import ReactNativeAsyncStorage from '@react-native-async-storage/async-storage';
 
 // grab these from firebase console -> project settings -> general ->
 // "your apps" (same project as FIREBASE_URL in your backend .env).
@@ -39,7 +44,30 @@ const firebaseConfig = {
 // this check stops a "firebase app already initialized" crash from
 // happening every time metro hot-reloads this file while you're testing
 const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
-export const auth = getAuth(app);
+
+// FIXED — this used to be a plain getAuth(app), which on React Native
+// defaults to IN-MEMORY-ONLY persistence (there's no browser
+// localStorage for it to fall back on like on web) — meaning every
+// single person got logged straight back out the moment they closed and
+// reopened the app. that directly contradicts watchAuthState's whole
+// documented point below ("so someone who already signed in before
+// doesn't get thrown back to a login screen every single time"). wiring
+// AsyncStorage in as the persistence layer is what actually makes that
+// true.
+//
+// initializeAuth can only be called ONCE per app instance — calling it a
+// second time throws, which is exactly what happens every time Metro
+// hot-reloads this file during dev. same fallback pattern as the
+// getApps() check above, just for auth instead of the app itself.
+let auth;
+try {
+  auth = initializeAuth(app, {
+    persistence: getReactNativePersistence(ReactNativeAsyncStorage)
+  });
+} catch (e) {
+  auth = getAuth(app); // already initialized (hot reload) — just grab the existing instance
+}
+export { auth };
 
 // makes a real account with an email + password, and sets the display
 // name in the same step so you don't need a second call right after
@@ -55,6 +83,26 @@ export async function signUp(email, password, displayName) {
 export async function logIn(email, password) {
   const cred = await signInWithEmailAndPassword(auth, email, password);
   return cred.user;
+}
+
+// NEW — upgrades an already-signed-in guest into a real account IN PLACE
+// (same uid before and after), instead of creating a brand new, separate
+// account like signUp() does. this matters: if a guest hits signUp()
+// directly, they get a fresh account with a fresh uid, and whatever was
+// already tied to their guest session (avatar choice, anything synced to
+// the backend under their guest uid) is just orphaned — silently lost.
+// linkWithCredential attaches the email/password login method to the
+// EXISTING anonymous user instead, so nothing has to be re-picked or
+// re-synced. this is what the in-settings "sign up" flow should call,
+// not signUp().
+export async function linkGuestAccount(email, password, displayName) {
+  if (!auth.currentUser) throw new Error('no active guest session to upgrade');
+  const credential = EmailAuthProvider.credential(email, password);
+  const result = await linkWithCredential(auth.currentUser, credential);
+  if (displayName) {
+    await updateProfile(result.user, { displayName });
+  }
+  return result.user;
 }
 
 // "continue as guest" — no email, no password, nothing to type. just
