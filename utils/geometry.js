@@ -4,7 +4,10 @@ import {
   windowHeight,
   SCREEN_PADDING,
   TOP_SAFE_ZONE,
-  BOTTOM_SAFE_ZONE
+  BOTTOM_SAFE_ZONE,
+  ANCHOR_X,
+  ANCHOR_Y,
+  ANCHOR_RADIUS
 } from '../constants/layout';
 import { CONSTELLATION_SHAPES } from '../constants/ConstellationShapes'; // NOTE: matches your actual filename (capital C). if you ever rename that file to lowercase, update this import to match — case mismatches here work fine on Windows/Mac but will 404 on Android/Linux builds
 
@@ -44,12 +47,41 @@ export function scatterPositionFor(slot, peerCount = 0, seed = '') {
   const usableWidth = windowWidth - SCREEN_PADDING * 2;
   const usableHeight = BOTTOM_SAFE_ZONE - TOP_SAFE_ZONE;
 
-  if (peerCount > 0 && seed) {
+  // CHANGED — found the actual root cause after two failed spread-
+  // multiplier attempts: constellationShapeFor picks RANDOMLY among every
+  // shape with enough nodes, and different shapes' first couple of nodes
+  // sit at wildly different distances from each other (Cassiopeia's
+  // node0/node1 are well separated; Leo's are close together even before
+  // any spread is applied). so whether 2-3 peers looked fine or crowded
+  // depended entirely on the random shape pick for that room — no spread
+  // multiplier fixes that consistently, since it's amplifying an already-
+  // small gap for some shapes. for small rooms (<=4 peers, the common
+  // case and where crowding is most obvious), bypass the shape system
+  // entirely and use a simple evenly-spaced layout that GUARANTEES
+  // consistent separation regardless of which shape a bigger room might
+  // have used. constellation shapes still kick in above 4 peers, where
+  // there's more room for their actual geometry to read as intended.
+  if (peerCount > 0 && peerCount <= 4 && seed) {
+    const rotationOffset = hashToUnit(seed + 'smallRoomRotation') * 360; // per-room variety, doesn't affect spacing
+    const angleStep = 360 / peerCount;
+    const angle = ((slot - 1) * angleStep + rotationOffset) * (Math.PI / 180);
+    const ex = 0.5 + Math.cos(angle) * 0.4; // ellipse radius as a fraction of the usable area
+    const ey = 0.5 + Math.sin(angle) * 0.4;
+    return {
+      x: SCREEN_PADDING + Math.max(0, Math.min(1, ex)) * usableWidth,
+      y: TOP_SAFE_ZONE + Math.max(0, Math.min(1, ey)) * usableHeight
+    };
+  }
+
+  if (peerCount > 4 && seed) {
     const shape = constellationShapeFor(peerCount, seed);
     const node = shape.nodes[(slot - 1) % shape.nodes.length];
+    const SPREAD = 1.6;
+    const spreadX = Math.max(0, Math.min(1, 0.5 + (node.x - 0.5) * SPREAD));
+    const spreadY = Math.max(0, Math.min(1, 0.5 + (node.y - 0.5) * SPREAD));
     return {
-      x: SCREEN_PADDING + node.x * usableWidth,
-      y: TOP_SAFE_ZONE + node.y * usableHeight
+      x: SCREEN_PADDING + spreadX * usableWidth,
+      y: TOP_SAFE_ZONE + spreadY * usableHeight
     };
   }
 
@@ -115,6 +147,9 @@ export const DUST_STARS = Array.from({ length: 52 }, (_, i) => ({
 // random placement) it stays quiet and non-distracting no matter how much
 // of the screen it covers. runs the full height so it fills the space
 // behind the anchor too, not just the peer zone.
+// KEPT (unused by default now, see GLOW_STARS below) — the grid reads as
+// "sensor texture", which is a different mood than "scattered glowing
+// stars". left in case you ever want to go back to it.
 const GRID_SPACING = 46; // px between dots, both axes
 export const GRID_DOTS = (() => {
   const dots = [];
@@ -137,6 +172,59 @@ export const GRID_DOTS = (() => {
   }
   return dots;
 })();
+
+// CHANGED — first pass was way too bold: 1-2.6px cores with a 4x-radius
+// halo peaking near-opaque read as solid gold blobs, not stars. real
+// background stars should be barely-there pinpricks that you register
+// more as "the screen is faintly alive" than as individual shapes.
+// shrunk the core, tightened and dimmed the halo way down, and lowered
+// the whole opacity band so even the brightest twinkle stays soft.
+// CHANGED — cut count further (42 -> 24) and App.js now renders one
+// circle per star instead of two (core + separate halo). every extra
+// animated shape is JS-thread work competing with the sweep's own
+// per-frame recompute, and this field was never worth that cost for a
+// glow effect that's barely visible at this size anyway.
+// CUT FURTHER — 24 -> 12. these 6 shared twinkle buckets are forced onto
+// the JS thread just like the old sweep recompute was (react-native-svg
+// can't native-drive opacity), so this is real standing JS-thread cost
+// for as long as the radar screen is mounted, for an effect that's
+// genuinely barely visible at this size. halving the star count roughly
+// halves how many native prop patches get pushed through per tick.
+const STAR_COUNT = 12;
+const TWINKLE_BUCKET_COUNT = 6; // must match App.js's own TWINKLE_BUCKET_COUNT
+// CHANGED — root cause of "staticy again": stars were scattered across the
+// FULL screen height, including directly behind/over the anchor's rings and
+// sweep. a bunch of small twinkling points layered on top of the orb's own
+// rings/wedge/ping-flashes is exactly the "many small elements crossing"
+// look that read as noise the first time (see SquigglyOrb's sweep-trail
+// fix). the anchor instrument needs to stay a clean, uncluttered read —
+// so any star that would land inside/near it gets pushed radially outward,
+// just clear of the ring, instead of being placed there.
+const ANCHOR_EXCLUSION_R = ANCHOR_RADIUS + 46;
+export const GLOW_STARS = Array.from({ length: STAR_COUNT }, (_, i) => {
+  let x = SCREEN_PADDING + hashToUnit(`glowstar${i}x`) * (windowWidth - SCREEN_PADDING * 2);
+  let y = TOP_SAFE_ZONE + hashToUnit(`glowstar${i}y`) * (windowHeight - TOP_SAFE_ZONE - 40);
+
+  const dx = x - ANCHOR_X;
+  const dy = y - ANCHOR_Y;
+  const dist = Math.hypot(dx, dy) || 1;
+  if (dist < ANCHOR_EXCLUSION_R) {
+    const factor = ANCHOR_EXCLUSION_R / dist;
+    x = ANCHOR_X + dx * factor;
+    y = ANCHOR_Y + dy * factor;
+    // re-clamp to screen bounds — pushing outward can overshoot near corners
+    x = Math.min(Math.max(x, SCREEN_PADDING), windowWidth - SCREEN_PADDING);
+    y = Math.min(Math.max(y, TOP_SAFE_ZONE), windowHeight - 40);
+  }
+
+  return {
+    x,
+    y,
+    r: 0.4 + hashToUnit(`glowstar${i}r`) * 0.6, // tiny bright core, 0.4-1.0px
+    o: 0.12 + hashToUnit(`glowstar${i}o`) * 0.22, // low base opacity, twinkle multiplies this
+    bucket: i % TWINKLE_BUCKET_COUNT
+  };
+});
 
 // 6 fixed angles the grey shards fly outward along on a failed transfer.
 // fixed, not random, so the shatter always looks the same clean shape.

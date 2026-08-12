@@ -25,8 +25,11 @@ export function toneIndexForDevice(deviceId) {
   return Math.min(idx, NODE_TONES.length - 1); // guard the rare 1.0 rounding edge case
 }
 
-// per-device base orb size, so the graph reads as hub/leaf nodes, not uniform dots
+// CHANGED AGAIN — this used to vary 15-21px per device on purpose ("hub/
+// leaf nodes, not uniform dots"), but with the new monoline ring+circle
+// mark that per-device variance just read as "one peer randomly bigger
+// than the others" (direct feedback, size it down and make it the same
+// as the rest). every peer is the same size now — no more seed lookup.
 export function radiusForDevice(deviceId) {
-  const seed = hashToUnit(deviceId + 'size'); // independent of position/tone hashes
-  return 5 + seed * 6; // 5–11px core radius, before the join-bounce spring multiplies it
+  return 16; // fixed core radius for every peer, before the join-bounce spring multiplies it
 }
