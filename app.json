@@ -3,8 +3,18 @@
     "name": "spatial-drop-mobile",
     "slug": "spatial-drop-mobile",
     "sdkVersion": "54.0.0",
+    "icon": "./assets/icons/icon-1024.png",
     "plugins": [
-      "expo-font"
+      "expo-font",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true,
+            "enableProguardInReleaseBuilds": false
+          }
+        }
+      ]
     ],
     "extra": {
       "eas": {
@@ -12,7 +22,20 @@
       }
     },
     "android": {
-      "package": "com.merub.spatialdropmobile"
+      "package": "com.merub.spatialdropmobile",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/icons/adaptive-icon-foreground.png",
+        "backgroundColor": "#121110"
+      }
+    },
+    "ios": {
+      "bundleIdentifier": "com.merub.spatialdropmobile",
+      "infoPlist": {
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": true
+        },
+        "NSLocalNetworkUsageDescription": "Spatial Drop connects directly to nearby devices on your WiFi network to send and receive files."
+      }
     }
   }
 }
