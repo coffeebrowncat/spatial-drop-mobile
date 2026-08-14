@@ -61,7 +61,21 @@ jobs:
             -archivePath "$RUNNER_TEMP/app.xcarchive" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            ONLY_ACTIVE_ARCH=NO
+            ONLY_ACTIVE_ARCH=NO \
+            SKIP_INSTALL=NO \
+            BUILD_LIBRARY_FOR_DISTRIBUTION=NO
+
+      - name: Verify the archive actually contains the app
+        # SKIP_INSTALL=NO is the fix above — without it, xcodebuild archive
+        # "succeeds" (exit 0) but skips copying the built .app into
+        # Products/Applications, producing a hollow xcarchive with nothing
+        # in it. Fail loudly here instead of silently zipping an empty
+        # folder like the last run did.
+        run: |
+          ls -la "$RUNNER_TEMP/app.xcarchive/Products/Applications/" || {
+            echo "Products/Applications is missing or empty — archive did not contain a built app."
+            exit 1
+          }
 
       - name: Package unsigned .ipa
         run: |
