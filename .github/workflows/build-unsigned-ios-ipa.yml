@@ -39,10 +39,19 @@ jobs:
       - name: Find the Xcode scheme name
         id: scheme
         working-directory: ios
+        # FIXED — the old version grabbed whatever scheme printed first
+        # under "Schemes:" from `xcodebuild -list -workspace`, which on
+        # this project's newer CocoaPods setup (modularized Pods with
+        # multiple sub-projects like ReactNativeDependencies,
+        # React-Core-prebuilt) can list a Pods scheme before the real app
+        # scheme. Archiving that Pods scheme "succeeds" but produces zero
+        # app content — exactly the empty-archive failure from the last
+        # run. The app's scheme name always matches its own .xcodeproj
+        # name, so read that directly instead of parsing the scheme list.
         run: |
-          SCHEME=$(xcodebuild -list -workspace *.xcworkspace | awk '/Schemes:/{getline; print; exit}' | xargs)
-          echo "found scheme: $SCHEME"
-          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
+          PROJECT_NAME=$(basename "$(ls -d *.xcodeproj | grep -v '^Pods\.xcodeproj$')" .xcodeproj)
+          echo "found scheme: $PROJECT_NAME"
+          echo "scheme=$PROJECT_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Archive app WITHOUT code signing
         # CODE_SIGNING_ALLOWED=NO / CODE_SIGNING_REQUIRED=NO is the whole
