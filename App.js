@@ -420,9 +420,10 @@ function AppInner() { // main function react native renders to the screen
     }
 
     if (data.type === 'incoming_files') { // the laptop is throwing to us
-      // NOTE: assumes the payload has a `fromDeviceId` field identifying the
-      // sender. check your backend's incoming_files message — if it uses a
-      // different key (senderId, deviceId, etc.), swap it in right here.
+      // backend's incoming_files message now sends both fromDeviceId
+      // (for highlighting the right node on the radar) and senderName
+      // (the real name they typed on the entry screen) — see
+      // transferController.js's uploadFiles.
       setIncomingFromId(data.fromDeviceId ?? null);
 
       if (data.trusted) { // already accepted before
@@ -430,8 +431,9 @@ function AppInner() { // main function react native renders to the screen
         return;
       }
 
+      const senderName = data.senderName || 'someone';
       Alert.alert( // native accept/decline popup
-        data.count > 1 ? `${data.count} files incoming` : 'a file is incoming',
+        data.count > 1 ? `${data.count} files from ${senderName}` : `a file from ${senderName}`,
         data.fileNames.join('\n'),
         [
           {
@@ -1255,13 +1257,58 @@ function AppInner() { // main function react native renders to the screen
   );
 }
 
+// NEW — SAFETY NET. React error boundaries only catch errors thrown
+// during rendering (not in event handlers or async code), but that's
+// exactly the class of bug that was crashing the whole app to Android's
+// "unexpectedly closed" dialog the instant a second real peer's data
+// arrived and something in the peer-constellation render tree threw.
+// without this, ANY render error — this one or a future one — takes
+// down the entire native process with zero on-screen explanation.
+// with it, the crash is contained to a plain fallback screen instead,
+// so the app stays open and the person can at least see something
+// happened instead of getting silently ejected mid-demo. this doesn't
+// fix whatever the underlying render bug is — it just stops it from
+// being catastrophic while that gets tracked down.
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false };
+  }
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+  componentDidCatch(error, info) {
+    console.error('caught a render error, showing fallback instead of crashing:', error, info);
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <View style={{ flex: 1, backgroundColor: '#121110', alignItems: 'center', justifyContent: 'center', padding: 24 }}>
+          <Text style={{ color: '#F2EDE6', fontSize: 16, textAlign: 'center', marginBottom: 8 }}>
+            something glitched — tap below to reopen
+          </Text>
+          <Pressable
+            onPress={() => this.setState({ hasError: false })}
+            style={{ marginTop: 12, paddingVertical: 10, paddingHorizontal: 24, borderRadius: 20, backgroundColor: 'rgba(140, 26, 63, 0.85)' }}
+          >
+            <Text style={{ color: '#F2EDE6', fontWeight: '600' }}>reload</Text>
+          </Pressable>
+        </View>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 // the actual default export now — AppInner is the one doing all the work,
 // this just makes sure it renders as a genuine child of ThemeProvider so
 // useTheme() inside it is live instead of frozen on the default context
 export default function App() {
   return (
-    <ThemeProvider>
-      <AppInner />
-    </ThemeProvider>
+    <ErrorBoundary>
+      <ThemeProvider>
+        <AppInner />
+      </ThemeProvider>
+    </ErrorBoundary>
   );
 }
