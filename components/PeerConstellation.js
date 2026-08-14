@@ -185,7 +185,19 @@ const PeerNode = ({ peer, peers, getSlotFor, getPeerScale, getPeerBreathe, targe
       <AnimatedCircle
         cx={pos.x}
         cy={pos.y}
-        r={scale.interpolate({ inputRange: [0, 1], outputRange: [0, baseRadius * 1.7] })}
+        // FIXED — was outputRange: [0, baseRadius * 1.7]. at scale=0 (a peer's
+        // join-bounce animation hasn't started yet, which is exactly the
+        // instant a second peer's data first arrives) this evaluated to a
+        // LITERAL 0 radius. this circle is filled with a percentage-based
+        // radial gradient (url(#nodeGlowIdle) etc, all defined as r="50%"),
+        // and Android's native SVG renderer throws a hard, uncatchable
+        // IllegalArgumentException ("ending radius must be > 0") when asked
+        // to paint a percentage gradient onto a zero-size shape — that's
+        // the exact crash that was kicking people out the instant someone
+        // else joined. 0.01 is visually identical to 0 (invisible until the
+        // bounce animation actually grows it) but is never literally zero,
+        // so the native gradient math always has a valid radius to work with.
+        r={scale.interpolate({ inputRange: [0, 1], outputRange: [0.01, baseRadius * 1.7] })}
         fill={gradientFor(state)}
         opacity={
           isActive
