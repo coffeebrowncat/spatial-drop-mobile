@@ -7,13 +7,24 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+
+      - name: Select a compatible Xcode version
+        # FIXED — the runner's DEFAULT Xcode (15.4 on macos-14) is too old;
+        # this project's React Native version requires >= 16.1, which is
+        # why pod install failed with "Invalid Podfile file: Please
+        # upgrade XCode." macos-15 runners ship multiple Xcode versions
+        # side by side — this explicitly picks the latest stable one
+        # instead of whatever happens to be selected by default.
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
 
       - name: Install JS dependencies
         run: npm install
